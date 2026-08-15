@@ -14,8 +14,7 @@ ROOM_NAMES = ["Cube-1", "Cube-2", "Cube-3"]
 banned_players = {}
 
 ALL_EVENTS_POOL = [
-    "CUBE_EXPLODE", "SPIKES_ACTIVE", "LASER_GRID",
-    "CUBE_SHRINK", "CUBE_EXPAND", "BOUNCY_WALLS", "CUBE_TWIST",
+    "CUBE_EXPLODE", "CUBE_SHRINK", "CUBE_EXPAND", "BOUNCY_WALLS", "CUBE_TWIST",
     "GRAVITY_UP", "MOON_GRAVITY", "SUPER_SPEED", "ICE_PHYSICS",
     "HEAVY_WEIGHT", "INVERT_KEYS", "HYPER_JUMP", "SLOW_MO",
     "DARKNESS", "SCREEN_SHAKE", "RED_ALERT", "COLOR_MADNESS"
@@ -24,10 +23,11 @@ ALL_EVENTS_POOL = [
 server_accounts = {}
 rooms = {
     name: {
-        "state": "IDLE",
+        "state": "IDLE", # IDLE, WAITING, IN_GAME, ROUND_OVER
         "timer": 10.0,
         "madness": 0.0,
         "active_events": [],
+        "events_survived": 0, # Лічильник пережитих евентів для соло
         "players": {}
     } for name in ROOM_NAMES
 }
@@ -99,6 +99,7 @@ async def handler(websocket):
         if rooms[room_name]["state"] == "IDLE":
             rooms[room_name]["state"] = "WAITING"
             rooms[room_name]["timer"] = 10.0
+            rooms[room_name]["events_survived"] = 0
 
         await safe_send(websocket, json.dumps({
             "type": "init",
@@ -178,12 +179,14 @@ async def game_loop():
                 r["state"] = "IDLE"
                 r["timer"] = 10.0
                 r["active_events"] = []
+                r["events_survived"] = 0
                 r["madness"] = 0.0
                 continue
 
             if r["state"] == "WAITING":
                 r["active_events"] = []
                 r["madness"] = 0.0
+                r["events_survived"] = 0
                 r["timer"] -= 0.033
                 if r["timer"] <= 0 or n_pls >= MAX_PLAYERS:
                     r["state"] = "IN_GAME"
@@ -191,12 +194,14 @@ async def game_loop():
                         p["alive"] = True
                         p["air_time"] = 0.0
                     r["active_events"] = [random.choice(ALL_EVENTS_POOL)]
+                    r["events_survived"] = 1
 
             elif r["state"] == "IN_GAME":
                 r["madness"] = min(100.0, r["madness"] + 0.033 * 8.5)
 
                 if r["madness"] >= 100.0:
                     r["madness"] = 0.0
+                    r["events_survived"] += 1
                     avail = [e for e in ALL_EVENTS_POOL if e not in r["active_events"]]
                     if avail:
                         r["active_events"].append(random.choice(avail))
@@ -205,12 +210,17 @@ async def game_loop():
 
                 alive_players = [p for p in pls.values() if p["alive"]]
                 all_dead = (len(alive_players) == 0 and n_pls > 0)
-                one_survivor = (len(alive_players) == 1 and n_pls > 1)
+                
+                # УМОВА ПЕРЕМОГИ:
+                # 1. Мультиплеєр: залишився 1 з кількох гравців.
+                # 2. Соло: 1 гравець пережив 10 евентів!
+                multi_win = (len(alive_players) == 1 and n_pls > 1)
+                solo_win = (len(alive_players) == 1 and n_pls == 1 and r["events_survived"] >= 10)
 
-                if all_dead or one_survivor:
+                if all_dead or multi_win or solo_win:
                     r["state"] = "ROUND_OVER"
                     r["timer"] = 4.0
-                    if len(alive_players) == 1:
+                    if multi_win or solo_win:
                         winner = alive_players[0]
                         server_accounts[winner["nick"]]["coins"] += 50
                         for ws, p_data in pls.items():
@@ -227,6 +237,7 @@ async def game_loop():
                     r["state"] = "WAITING"
                     r["timer"] = 8.0
                     r["active_events"] = []
+                    r["events_survived"] = 0
                     for p in pls.values():
                         p["alive"] = True
                         p["x"] = random.uniform(-1.0, 1.0)
@@ -240,6 +251,7 @@ async def game_loop():
                 "timer": max(0, int(r["timer"])),
                 "madness": r["madness"],
                 "events": r["active_events"],
+                "survived": r["events_survived"],
                 "lobby_stats": lobby_stats,
                 "players": {
                     p["nick"]: {
