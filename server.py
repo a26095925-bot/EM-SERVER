@@ -24,16 +24,15 @@ server_accounts = {}
 rooms = {
     name: {
         "state": "IDLE", # IDLE, WAITING, IN_GAME, ROUND_OVER
-        "timer": 15.0,
+        "timer": 10.0,
         "madness": 0.0,
         "active_events": [],
-        "players": {} # ws: {nick, x, y, alive, skin, air_time}
+        "players": {}
     } for name in ROOM_NAMES
 }
 client_rooms = {}
 
 async def safe_send(ws, message):
-    """Безпечна відправка пакетів без помилок у логах при виході клієнта"""
     try:
         await ws.send(message)
     except:
@@ -55,12 +54,11 @@ async def handler(websocket):
             left_sec = int(banned_players[req_nick] - now)
             await safe_send(websocket, json.dumps({
                 "type": "banned",
-                "msg": f"Античит: Бан за політ! Залишилось {left_sec} сек."
+                "msg": f"Античит: Бан! Залишилось {left_sec} сек."
             }))
             await websocket.close()
             return
 
-        # Вибір кімнати (або бажана кімната гравця, або автопошук)
         target_room = None
         if pref_room in ROOM_NAMES and len(rooms[pref_room]["players"]) < MAX_PLAYERS:
             target_room = pref_room
@@ -99,7 +97,7 @@ async def handler(websocket):
 
         if rooms[room_name]["state"] == "IDLE":
             rooms[room_name]["state"] = "WAITING"
-            rooms[room_name]["timer"] = 15.0
+            rooms[room_name]["timer"] = 10.0
 
         await safe_send(websocket, json.dumps({
             "type": "init",
@@ -147,10 +145,8 @@ async def handler(websocket):
                         acc["coins"] -= cost
                         acc["skins"].append(s_name)
                         await safe_send(websocket, json.dumps({"type": "account_update", "account": acc}))
-            except:
-                pass
-    except:
-        pass
+            except: pass
+    except: pass
     finally:
         if websocket in client_rooms:
             r = client_rooms[websocket]
@@ -162,7 +158,6 @@ async def game_loop():
     while True:
         await asyncio.sleep(0.033)
 
-        # Збір глобальної статистики по кімнатах для лобі
         lobby_stats = {
             r_name: {
                 "players": f"{len(r['players'])}/{MAX_PLAYERS}",
@@ -177,7 +172,7 @@ async def game_loop():
 
             if n_pls == 0:
                 r["state"] = "IDLE"
-                r["timer"] = 15.0
+                r["timer"] = 10.0
                 r["active_events"] = []
                 r["madness"] = 0.0
                 continue
@@ -188,33 +183,30 @@ async def game_loop():
                 r["timer"] -= 0.033
                 if r["timer"] <= 0 or n_pls >= MAX_PLAYERS:
                     r["state"] = "IN_GAME"
-                    r["timer"] = 60.0
                     for p in pls.values():
                         p["alive"] = True
                         p["air_time"] = 0.0
-                    # ПЕРШИЙ ЕВЕНТ - ПОВНІСТЮ РАНДОМНИЙ
                     r["active_events"] = [random.choice(ALL_EVENTS_POOL)]
 
             elif r["state"] == "IN_GAME":
-                r["timer"] -= 0.033
-                r["madness"] = min(100.0, r["madness"] + 0.033 * 8.0)
+                # Заповнення шкали божевілля (кожні ~12 сек новий евент)
+                r["madness"] = min(100.0, r["madness"] + 0.033 * 8.5)
 
-                # Додавання нового евенту та ліміт максимум 3 одночасно
                 if r["madness"] >= 100.0:
                     r["madness"] = 0.0
                     avail = [e for e in ALL_EVENTS_POOL if e not in r["active_events"]]
                     if avail:
                         r["active_events"].append(random.choice(avail))
-                    # Якщо більше 3 евентів - видаляємо найстаріший
+                    # Підтримуємо максимум 3 активних евенти
                     if len(r["active_events"]) > 3:
                         r["active_events"].pop(0)
 
                 alive_players = [p for p in pls.values() if p["alive"]]
                 all_dead = (len(alive_players) == 0 and n_pls > 0)
                 one_survivor = (len(alive_players) == 1 and n_pls > 1)
-                time_up = (r["timer"] <= 0)
 
-                if all_dead or one_survivor or time_up:
+                # Перезапуск ТІЛЬКИ коли визначено переможця чи всі впали
+                if all_dead or one_survivor:
                     r["state"] = "ROUND_OVER"
                     r["timer"] = 4.0
                     if len(alive_players) == 1:
@@ -232,7 +224,7 @@ async def game_loop():
                 r["timer"] -= 0.033
                 if r["timer"] <= 0:
                     r["state"] = "WAITING"
-                    r["timer"] = 10.0
+                    r["timer"] = 8.0
                     r["active_events"] = []
                     for p in pls.values():
                         p["alive"] = True
@@ -256,13 +248,12 @@ async def game_loop():
                 }
             })
 
-            # Безпечна одночасна розсилка всім сокетам
             send_tasks = [safe_send(ws, packet) for ws in list(pls.keys())]
             if send_tasks:
                 await asyncio.gather(*send_tasks, return_exceptions=True)
 
 async def main():
-    print(f"[*] СЕРВЕР ЗАПУЩЕНО НА {PORT} (БЕЗ ПОМИЛОК ЛОГІВ + МАКС 3 ЕВЕНТИ)")
+    print(f"[*] СЕРВЕР ЗАПУЩЕНО НА {PORT} (REAL-TIME ENGINE)")
     asyncio.create_task(game_loop())
     async with websockets.serve(handler, HOST, PORT, ping_interval=10, ping_timeout=5):
         await asyncio.Future()
