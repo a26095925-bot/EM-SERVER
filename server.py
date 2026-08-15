@@ -14,7 +14,8 @@ ROOM_NAMES = ["Cube-1", "Cube-2", "Cube-3"]
 banned_players = {}
 
 ALL_EVENTS_POOL = [
-    "CUBE_EXPLODE", "CUBE_SHRINK", "CUBE_EXPAND", "BOUNCY_WALLS", "CUBE_TWIST",
+    "PIZZAFACE_CHASE", "CUBE_EXPLODE", "SPIKES_ACTIVE", "LASER_GRID",
+    "CUBE_SHRINK", "CUBE_EXPAND", "BOUNCY_WALLS", "CUBE_TWIST",
     "GRAVITY_UP", "MOON_GRAVITY", "SUPER_SPEED", "ICE_PHYSICS",
     "HEAVY_WEIGHT", "INVERT_KEYS", "HYPER_JUMP", "SLOW_MO",
     "DARKNESS", "SCREEN_SHAKE", "RED_ALERT", "COLOR_MADNESS"
@@ -23,7 +24,7 @@ ALL_EVENTS_POOL = [
 server_accounts = {}
 rooms = {
     name: {
-        "state": "IDLE", # IDLE, WAITING, IN_GAME, ROUND_OVER
+        "state": "IDLE",
         "timer": 10.0,
         "madness": 0.0,
         "active_events": [],
@@ -189,7 +190,6 @@ async def game_loop():
                     r["active_events"] = [random.choice(ALL_EVENTS_POOL)]
 
             elif r["state"] == "IN_GAME":
-                # Заповнення шкали божевілля (кожні ~12 сек новий евент)
                 r["madness"] = min(100.0, r["madness"] + 0.033 * 8.5)
 
                 if r["madness"] >= 100.0:
@@ -197,7 +197,6 @@ async def game_loop():
                     avail = [e for e in ALL_EVENTS_POOL if e not in r["active_events"]]
                     if avail:
                         r["active_events"].append(random.choice(avail))
-                    # Підтримуємо максимум 3 активних евенти
                     if len(r["active_events"]) > 3:
                         r["active_events"].pop(0)
 
@@ -205,7 +204,6 @@ async def game_loop():
                 all_dead = (len(alive_players) == 0 and n_pls > 0)
                 one_survivor = (len(alive_players) == 1 and n_pls > 1)
 
-                # Перезапуск ТІЛЬКИ коли визначено переможця чи всі впали
                 if all_dead or one_survivor:
                     r["state"] = "ROUND_OVER"
                     r["timer"] = 4.0
@@ -253,7 +251,7 @@ async def game_loop():
                 await asyncio.gather(*send_tasks, return_exceptions=True)
 
 async def main():
-    print(f"[*] СЕРВЕР ЗАПУЩЕНО НА {PORT} (REAL-TIME ENGINE)")
+    print(f"[*] СЕРВЕР EVENT MADNESS ПРАЦЮЄ НА {PORT}")
     asyncio.create_task(game_loop())
     async with websockets.serve(handler, HOST, PORT, ping_interval=10, ping_timeout=5):
         await asyncio.Future()
