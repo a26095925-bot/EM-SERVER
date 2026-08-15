@@ -11,7 +11,6 @@ HOST = "0.0.0.0"
 MAX_PLAYERS = 5
 ROOM_NAMES = ["Cube-1", "Cube-2", "Cube-3"]
 
-# База забанених гравців: { ip_or_nick: unban_timestamp }
 banned_players = {}
 
 CUBE_MUTATIONS = ["CUBE_EXPLODE", "CUBE_SHRINK", "CUBE_EXPAND", "BOUNCY_WALLS", "CUBE_TWIST"]
@@ -25,7 +24,7 @@ server_accounts = {}
 rooms = {
     name: {
         "state": "IDLE",
-        "timer": 20.0,
+        "timer": 15.0,
         "madness": 0.0,
         "active_events": [],
         "players": {}
@@ -43,18 +42,16 @@ async def handler(websocket):
         req_nick = data.get("nick", "Player")
         client_skin = data.get("skin", "Classic")
 
-        # Перевірка античит-бану
         now = time.time()
         if req_nick in banned_players and banned_players[req_nick] > now:
             left_sec = int(banned_players[req_nick] - now)
             await websocket.send(json.dumps({
                 "type": "banned",
-                "msg": f"Античит: Бан за нескінченний політ! Залишилось {left_sec} сек."
+                "msg": f"Античит: Бан за політ! Залишилось {left_sec} сек."
             }))
             await websocket.close()
             return
 
-        # Пошук кімнати
         target_room = None
         for r in ROOM_NAMES:
             if rooms[r]["state"] in ["IDLE", "WAITING"] and len(rooms[r]["players"]) < MAX_PLAYERS:
@@ -82,16 +79,15 @@ async def handler(websocket):
         rooms[room_name]["players"][websocket] = {
             "nick": client_nick,
             "x": random.uniform(-1.0, 1.0),
-            "y": -2.4,
+            "y": -2.6,
             "alive": is_alive_now,
             "skin": client_skin,
-            "air_time": 0.0,
-            "last_y": -2.4
+            "air_time": 0.0
         }
 
         if rooms[room_name]["state"] == "IDLE":
             rooms[room_name]["state"] = "WAITING"
-            rooms[room_name]["timer"] = 20.0
+            rooms[room_name]["timer"] = 15.0
 
         await websocket.send(json.dumps({
             "type": "init",
@@ -108,19 +104,17 @@ async def handler(websocket):
             if pkt.get("type") == "pos":
                 p["x"] = pkt["x"]
                 p["y"] = pkt["y"]
-
-                # АНТИЧИТ НА СЕРВЕРІ: відлік часу в повітрі
                 on_ground = pkt.get("on_ground", False)
                 on_wall = pkt.get("on_wall", False)
                 
+                # Античит перевірка
                 if not on_ground and not on_wall and p["alive"]:
                     p["air_time"] += 0.033
                     if p["air_time"] > 7.0 and p["y"] > -5.0:
-                        # БАН на 15 секунд
                         banned_players[client_nick] = time.time() + 15.0
                         await websocket.send(json.dumps({
                             "type": "banned",
-                            "msg": "Античит: Виявлено Fly-Hack (>7 сек у повітрі)! Бан на 15 сек."
+                            "msg": "Античит: Fly-Hack (>7 сек у повітрі)! Бан на 15 сек."
                         }))
                         await websocket.close()
                         break
@@ -160,7 +154,7 @@ async def game_loop():
 
             if n_pls == 0:
                 r["state"] = "IDLE"
-                r["timer"] = 20.0
+                r["timer"] = 15.0
                 r["active_events"] = []
                 r["madness"] = 0.0
                 continue
@@ -175,7 +169,6 @@ async def game_loop():
                     for p in pls.values(): 
                         p["alive"] = True
                         p["air_time"] = 0.0
-                    # ПЕРШИЙ ЕВЕНТ - ЗАВЖДИ ВИБУХ СТІН ТА ДАХУ!
                     r["active_events"] = ["CUBE_EXPLODE"]
 
             elif r["state"] == "IN_GAME":
@@ -189,9 +182,15 @@ async def game_loop():
                         r["active_events"].append(random.choice(avail))
 
                 alive_players = [p for p in pls.values() if p["alive"]]
-                if (len(alive_players) <= 1 and n_pls > 1) or (n_pls == 1 and not alive_players) or r["timer"] <= 0:
+
+                # 1. ПЕРЕВІРКА НА РЕСТАРТ: якщо ВСІ мертві (0 живих) або залишився 1 з кількох
+                all_dead = (len(alive_players) == 0 and n_pls > 0)
+                one_survivor = (len(alive_players) == 1 and n_pls > 1)
+                time_up = (r["timer"] <= 0)
+
+                if all_dead or one_survivor or time_up:
                     r["state"] = "ROUND_OVER"
-                    r["timer"] = 5.0
+                    r["timer"] = 4.0  # 4 секунди на підсумки раунду
                     if len(alive_players) == 1:
                         winner = alive_players[0]
                         server_accounts[winner["nick"]]["coins"] += 50
@@ -207,12 +206,15 @@ async def game_loop():
 
             elif r["state"] == "ROUND_OVER":
                 r["timer"] -= 0.033
+                # ПЕРЕЗАПУСК КУБА ТА РЕСПАВН
                 if r["timer"] <= 0:
                     r["state"] = "WAITING"
-                    r["timer"] = 20.0
+                    r["timer"] = 10.0
                     r["active_events"] = []
                     for p in pls.values(): 
                         p["alive"] = True
+                        p["x"] = random.uniform(-1.0, 1.0)
+                        p["y"] = -2.6
                         p["air_time"] = 0.0
 
             packet = json.dumps({
@@ -234,7 +236,7 @@ async def game_loop():
                 except: pass
 
 async def main():
-    print(f"[*] СЕРВЕР ЗАПУЩЕНО НА {PORT} (АНТИЧИТ + ПРОЗОРИЙ ДАХ)")
+    print(f"[*] СЕРВЕР ЗАПУЩЕНО НА {PORT} (АВТОРЕСТАРТ + ЩИТ)")
     asyncio.create_task(game_loop())
     async with websockets.serve(handler, HOST, PORT, ping_interval=10, ping_timeout=5):
         await asyncio.Future()
