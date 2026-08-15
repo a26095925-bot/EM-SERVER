@@ -13,21 +13,25 @@ ROOM_NAMES = ["Cube-1", "Cube-2", "Cube-3"]
 
 banned_players = {}
 
+# 37+ БОЖЕВІЛЬНИХ ЕВЕНТІВ
 ALL_EVENTS_POOL = [
     "CUBE_EXPLODE", "CUBE_SHRINK", "CUBE_EXPAND", "BOUNCY_WALLS", "CUBE_TWIST",
-    "GRAVITY_UP", "MOON_GRAVITY", "SUPER_SPEED", "ICE_PHYSICS",
-    "HEAVY_WEIGHT", "INVERT_KEYS", "HYPER_JUMP", "SLOW_MO",
-    "DARKNESS", "SCREEN_SHAKE", "RED_ALERT", "COLOR_MADNESS"
+    "GRAVITY_UP", "MOON_GRAVITY", "SUPER_SPEED", "ICE_PHYSICS", "HEAVY_WEIGHT",
+    "INVERT_KEYS", "HYPER_JUMP", "SLOW_MO", "DARKNESS", "SCREEN_SHAKE",
+    "RED_ALERT", "COLOR_MADNESS", "METEOR_STORM", "GRAVITY_LEFT", "GRAVITY_RIGHT",
+    "TINY_PLAYER", "GIANT_PLAYER", "EARTHQUAKE", "GLITCH_WORLD", "BOUNCE_FRENZY",
+    "SLIPPERY_AIR", "SUPER_DASH", "LASER_DISCO", "MIRROR_WORLD", "ZERO_FRICTION",
+    "SPEED_CHAOS", "HEAVY_FALL", "FOG_OF_WAR", "LOW_CEILING", "NO_FLOOR", "COLOR_PULSE"
 ]
 
 server_accounts = {}
 rooms = {
     name: {
-        "state": "IDLE", # IDLE, WAITING, IN_GAME, ROUND_OVER
+        "state": "IDLE",
         "timer": 10.0,
         "madness": 0.0,
         "active_events": [],
-        "events_survived": 0, # Лічильник пережитих евентів для соло
+        "events_survived": 0,
         "players": {}
     } for name in ROOM_NAMES
 }
@@ -210,10 +214,6 @@ async def game_loop():
 
                 alive_players = [p for p in pls.values() if p["alive"]]
                 all_dead = (len(alive_players) == 0 and n_pls > 0)
-                
-                # УМОВА ПЕРЕМОГИ:
-                # 1. Мультиплеєр: залишився 1 з кількох гравців.
-                # 2. Соло: 1 гравець пережив 10 евентів!
                 multi_win = (len(alive_players) == 1 and n_pls > 1)
                 solo_win = (len(alive_players) == 1 and n_pls == 1 and r["events_survived"] >= 10)
 
