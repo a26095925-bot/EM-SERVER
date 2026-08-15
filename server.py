@@ -14,7 +14,7 @@ ROOM_NAMES = ["Cube-1", "Cube-2", "Cube-3"]
 banned_players = {}
 
 ALL_EVENTS_POOL = [
-    "PIZZAFACE_CHASE", "CUBE_EXPLODE", "SPIKES_ACTIVE", "LASER_GRID",
+    "CUBE_EXPLODE", "SPIKES_ACTIVE", "LASER_GRID",
     "CUBE_SHRINK", "CUBE_EXPAND", "BOUNCY_WALLS", "CUBE_TWIST",
     "GRAVITY_UP", "MOON_GRAVITY", "SUPER_SPEED", "ICE_PHYSICS",
     "HEAVY_WEIGHT", "INVERT_KEYS", "HYPER_JUMP", "SLOW_MO",
@@ -145,7 +145,10 @@ async def handler(websocket):
                     if acc["coins"] >= cost and s_name not in acc["skins"]:
                         acc["coins"] -= cost
                         acc["skins"].append(s_name)
-                        await safe_send(websocket, json.dumps({"type": "account_update", "account": acc}))
+                        await safe_send(websocket, json.dumps({
+                            "type": "account_update",
+                            "account": acc
+                        }))
             except: pass
     except: pass
     finally:
