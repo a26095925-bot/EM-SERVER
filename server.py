@@ -236,4 +236,36 @@ async def game_loop():
                     r["active_events"] = []
                     for p in pls.values():
                         p["alive"] = True
-                        p["x"] = random.uniform(-1
+                        p["x"] = random.uniform(-1.0, 1.0)
+                        p["y"] = -2.6
+                        p["air_time"] = 0.0
+
+            packet = json.dumps({
+                "type": "sync",
+                "state": r["state"],
+                "room": r_name,
+                "timer": max(0, int(r["timer"])),
+                "madness": r["madness"],
+                "events": r["active_events"],
+                "lobby_stats": lobby_stats,
+                "players": {
+                    p["nick"]: {
+                        "x": p["x"], "y": p["y"], "alive": p["alive"],
+                        "skin": p["skin"]
+                    } for p in pls.values()
+                }
+            })
+
+            # Безпечна одночасна розсилка всім сокетам
+            send_tasks = [safe_send(ws, packet) for ws in list(pls.keys())]
+            if send_tasks:
+                await asyncio.gather(*send_tasks, return_exceptions=True)
+
+async def main():
+    print(f"[*] СЕРВЕР ЗАПУЩЕНО НА {PORT} (БЕЗ ПОМИЛОК ЛОГІВ + МАКС 3 ЕВЕНТИ)")
+    asyncio.create_task(game_loop())
+    async with websockets.serve(handler, HOST, PORT, ping_interval=10, ping_timeout=5):
+        await asyncio.Future()
+
+if __name__ == "__main__":
+    asyncio.run(main())
