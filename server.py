@@ -11,46 +11,52 @@ HOST = "0.0.0.0"
 MAX_PLAYERS = 5
 ROOM_NAMES = ["Cube-1", "Cube-2", "Cube-3"]
 
-# База збережень на сервері: { nickname: {"coins": 0, "skins": ["Classic"], "wins": 0} }
-server_accounts = {}
+# 30+ БОЖЕВІЛЬНИХ ЕВЕНТІВ
+CUBE_MUTATION_EVENTS = [
+    "CUBE_EXPLODE", "NO_FLOOR", "CUBE_SHRINK", "CUBE_EXPAND", 
+    "LOW_CEILING", "BOUNCY_WALLS", "CUBE_TWIST", "ZERO_G_CUBE"
+]
 
+OTHER_EVENTS = [
+    "GRAVITY_UP", "MOON_GRAVITY", "SUPER_SPEED", "ICE_PHYSICS",
+    "HEAVY_WEIGHT", "INVERT_KEYS", "HYPER_JUMP", "SLOW_MO",
+    "TURBO_MAX", "GHOST_PLAYERS", "METEOR_RAIN", "LASER_SWEEP",
+    "DARKNESS", "ACID_RAIN", "SCREEN_SHAKE", "RED_ALERT",
+    "COLOR_MADNESS", "FLOOR_IS_LAVA", "SUPER_FRICTION", "REVERSE_TIME",
+    "RANDOM_TELEPORT", "TINY_PLAYERS", "GIANT_PLAYERS", "VOLATILE_WALLS"
+]
+
+ALL_EVENTS_POOL = CUBE_MUTATION_EVENTS + OTHER_EVENTS
+
+server_accounts = {}
 rooms = {
     name: {
         "state": "WAITING", # WAITING, IN_GAME, ROUND_OVER
         "timer": 20.0,
         "madness": 0.0,
         "active_events": [],
-        "players": {} # ws: {nick, x, y, alive, color, skin, emote, emote_time}
+        "players": {} # ws: {nick, x, y, alive, skin, emote, emote_time}
     } for name in ROOM_NAMES
 }
 client_rooms = {}
-
-EVENTS_POOL = ["GRAVITY_FLIP", "SPEED_TURBO", "CUBE_SHAKE", "INVERT_CONTROLS"]
-
-def save_db():
-    try:
-        with open("server_db.json", "w") as f:
-            json.dumps(server_accounts, f)
-    except: pass
 
 def get_unique_nick(room_name, base_nick):
     used_nicks = [p["nick"] for p in rooms[room_name]["players"].values()]
     if base_nick not in used_nicks:
         return base_nick
-    return f"{base_nick}_2"
+    return f"{base_nick}_{random.randint(2, 9)}"
 
 async def handler(websocket):
     client_nick = None
     room_name = None
 
     try:
-        # Перший пакет - логін
         raw = await websocket.recv()
         data = json.loads(raw)
-        req_nick = data.get("nick", f"Player_{random.randint(100,999)}")
+        req_nick = data.get("nick", "Player")
         client_skin = data.get("skin", "Classic")
 
-        # Шукаємо найкращу кімнату
+        # Розподіл по кімнатах
         target_room = None
         for r in ROOM_NAMES:
             if len(rooms[r]["players"]) < MAX_PLAYERS and req_nick not in [p["nick"] for p in rooms[r]["players"].values()]:
@@ -68,7 +74,6 @@ async def handler(websocket):
         client_rooms[websocket] = room_name
         client_nick = get_unique_nick(room_name, req_nick)
 
-        # Завантаження акаунта
         if client_nick not in server_accounts:
             server_accounts[client_nick] = {"coins": data.get("coins", 0), "skins": ["Classic"], "wins": 0}
         acc = server_accounts[client_nick]
@@ -83,7 +88,6 @@ async def handler(websocket):
             "emote_time": 0
         }
 
-        # Відповідь клієнту
         await websocket.send(json.dumps({
             "type": "init",
             "nick": client_nick,
@@ -91,7 +95,6 @@ async def handler(websocket):
             "account": acc
         }))
 
-        # Обробка дій клієнта
         async for msg in websocket:
             pkt = json.loads(msg)
             p = rooms[room_name]["players"].get(websocket)
@@ -106,7 +109,6 @@ async def handler(websocket):
                 p["emote"] = pkt["emote"]
                 p["emote_time"] = time.time() + 2.5
             elif pkt.get("type") == "chat":
-                # Трансляція повідомлення в чат кімнати
                 chat_pkt = json.dumps({"type": "chat", "nick": client_nick, "text": pkt["text"]})
                 for ws in list(rooms[room_name]["players"].keys()):
                     try: await ws.send(chat_pkt)
@@ -118,7 +120,6 @@ async def handler(websocket):
                     acc["coins"] -= cost
                     acc["skins"].append(s_name)
                     await websocket.send(json.dumps({"type": "account_update", "account": acc}))
-
     except: pass
     finally:
         if websocket in client_rooms:
@@ -143,19 +144,21 @@ async def game_loop():
                     r["timer"] -= 0.033
                     if r["timer"] <= 0 or n_pls >= MAX_PLAYERS:
                         r["state"] = "IN_GAME"
-                        r["timer"] = 60.0
-                        for p in pls.values():
-                            p["alive"] = True
+                        r["timer"] = 75.0
+                        for p in pls.values(): p["alive"] = True
+                        # ПЕРШИЙ ЕВЕНТ ЗАВЖДИ ЗМІНЮЄ КУБ!
+                        r["active_events"] = [random.choice(CUBE_MUTATION_EVENTS)]
                 else:
                     r["timer"] = 20.0
 
             elif r["state"] == "IN_GAME":
                 # Заповнення шкали божевілля
-                r["madness"] = min(100.0, r["madness"] + 0.033 * 4.5)
+                r["madness"] = min(100.0, r["madness"] + 0.033 * 5.0)
                 if r["madness"] >= 100.0:
                     r["madness"] = 0.0
-                    new_ev = random.choice([e for e in EVENTS_POOL if e not in r["active_events"]] or EVENTS_POOL)
-                    r["active_events"].append(new_ev)
+                    available = [e for e in ALL_EVENTS_POOL if e not in r["active_events"]]
+                    if available:
+                        r["active_events"].append(random.choice(available))
 
                 # Перевірка тих, хто вижив
                 alive_players = [p for p in pls.values() if p["alive"]]
@@ -166,7 +169,6 @@ async def game_loop():
                         winner = alive_players[0]
                         server_accounts[winner["nick"]]["coins"] += 50
                         server_accounts[winner["nick"]]["wins"] += 1
-                        # Оновлюємо переможця
                         for ws, p_data in pls.items():
                             if p_data["nick"] == winner["nick"]:
                                 try:
@@ -182,10 +184,10 @@ async def game_loop():
                 if r["timer"] <= 0:
                     r["state"] = "WAITING"
                     r["timer"] = 20.0
-                    for p in pls.values():
-                        p["alive"] = True
+                    r["active_events"] = []
+                    for p in pls.values(): p["alive"] = True
 
-            # Пакет стану кімнати
+            # Синхронізація зі всіма в кубі
             room_packet = json.dumps({
                 "type": "sync",
                 "state": r["state"],
