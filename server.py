@@ -8,10 +8,10 @@ import random
 PORT = int(os.environ.get("PORT", 10000))
 HOST = "0.0.0.0"
 
-# 5 кімнат 1v1 + 2 кімнати 1v1v1
+# Вестерн-арени: 5 кімнат 1v1 + 2 кімнати 1v1v1
 ROOMS_CONFIG = {
-    "Duel-1": 2, "Duel-2": 2, "Duel-3": 2, "Duel-4": 2, "Duel-5": 2,
-    "Standoff-1": 3, "Standoff-2": 3
+    "Canyon-1": 2, "Canyon-2": 2, "Canyon-3": 2, "Canyon-4": 2, "Canyon-5": 2,
+    "Saloon-1": 3, "Saloon-2": 3
 }
 ROOM_NAMES = list(ROOMS_CONFIG.keys())
 
@@ -44,7 +44,7 @@ async def handler(websocket):
     try:
         raw = await websocket.recv()
         data = json.loads(raw)
-        req_nick = data.get("nick", "Cowboy")
+        req_nick = data.get("nick", "Sheriff")
         client_skin = data.get("skin", "Classic")
         client_prefix = data.get("prefix", "")
         client_avatar_b64 = data.get("avatar_b64", "")
@@ -83,7 +83,7 @@ async def handler(websocket):
         if client_nick not in server_accounts:
             server_accounts[client_nick] = {"cubixes": data.get("cubixes", 0), "skins": ["Classic"], "prefixes": [""], "wins": 0}
 
-        spawn_x = -2.2 if len(rooms[room_name]["players"]) == 0 else 2.2
+        spawn_x = -2.4 if len(rooms[room_name]["players"]) == 0 else 2.4
 
         rooms[room_name]["players"][websocket] = {
             "nick": client_nick,
@@ -133,7 +133,6 @@ async def handler(websocket):
                                 await safe_send(ws_c, json.dumps({"type": "quick_draw_awarded", "winner": client_nick}))
 
                 elif pkt.get("type") == "bullet_fired":
-                    # Broadcast bullet tracer to room
                     bullet_pkt = json.dumps({
                         "type": "bullet_tracer",
                         "from_x": pkt["from_x"], "from_y": pkt["from_y"],
@@ -219,7 +218,6 @@ async def game_loop():
                 r["timer"] -= 0.033
                 alive_pls = [p for p in pls.values() if p["alive"] and p["hp"] > 0]
                 
-                # Check duel victory
                 if (len(alive_pls) == 1 and n_pls > 1) or (len(alive_pls) == 0 and n_pls > 0) or r["timer"] <= 0:
                     r["state"] = "ROUND_OVER"
                     r["timer"] = 4.0
@@ -264,7 +262,7 @@ async def game_loop():
             if send_tasks: await asyncio.gather(*send_tasks, return_exceptions=True)
 
 async def main():
-    print(f"[*] WESTERN DUEL SERVER ONLINE ON PORT {PORT}")
+    print(f"[*] CANYON DUEL SERVER ONLINE ON PORT {PORT}")
     asyncio.create_task(game_loop())
     async with websockets.serve(handler, HOST, PORT, ping_interval=10, ping_timeout=5):
         await asyncio.Future()
