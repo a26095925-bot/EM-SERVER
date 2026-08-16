@@ -302,7 +302,6 @@ async def game_loop():
                         p["y"] = -2.6
                         p["air_time"] = 0.0
 
-            # Synchronized Laser parameters calculated by server clock
             elapsed = now - r["start_time"]
             server_laser_timer = elapsed % 5.5
             server_laser_mode = int((elapsed // 5.5) % 3)
@@ -336,7 +335,7 @@ async def game_loop():
                 await asyncio.gather(*send_tasks, return_exceptions=True)
 
 async def main():
-    print(f"[*] SYNCHRONIZED SERVER RUNNING ON PORT {PORT}")
+    print(f"[*] EVENT MADNESS SERVER ONLINE ON PORT {PORT}")
     asyncio.create_task(game_loop())
     async with websockets.serve(handler, HOST, PORT, ping_interval=10, ping_timeout=5):
         await asyncio.Future()
