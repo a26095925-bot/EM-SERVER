@@ -31,6 +31,8 @@ rooms = {
         "madness": 0.0,
         "active_events": [],
         "events_survived": 0,
+        "wave": 1,
+        "is_surge": False,
         "players": {}
     } for name in ROOM_NAMES
 }
@@ -113,6 +115,8 @@ async def handler(websocket):
             rooms[room_name]["state"] = "WAITING"
             rooms[room_name]["timer"] = 10.0
             rooms[room_name]["events_survived"] = 0
+            rooms[room_name]["wave"] = 1
+            rooms[room_name]["is_surge"] = False
 
         await safe_send(websocket, json.dumps({
             "type": "init",
@@ -203,6 +207,8 @@ async def game_loop():
                 r["timer"] = 10.0
                 r["active_events"] = []
                 r["events_survived"] = 0
+                r["wave"] = 1
+                r["is_surge"] = False
                 r["madness"] = 0.0
                 continue
 
@@ -210,6 +216,8 @@ async def game_loop():
                 r["active_events"] = []
                 r["madness"] = 0.0
                 r["events_survived"] = 0
+                r["wave"] = 1
+                r["is_surge"] = False
                 r["timer"] -= 0.033
                 if r["timer"] <= 0 or n_pls >= MAX_PLAYERS:
                     r["state"] = "IN_GAME"
@@ -225,21 +233,38 @@ async def game_loop():
                 if r["madness"] >= 100.0:
                     r["madness"] = 0.0
                     r["events_survived"] += 1
-                    avail = [e for e in ALL_EVENTS_POOL if e not in r["active_events"]]
-                    if avail:
-                        r["active_events"].append(random.choice(avail))
-                    if len(r["active_events"]) > 3:
-                        r["active_events"].pop(0)
+                    
+                    # Розрахунок Хвилі
+                    r["wave"] = 1 + (r["events_survived"] // 5)
+                    reward = 25 if (r["events_survived"] % 5 == 0) else 10
+
+                    # Нарахування кубіксів живим гравцям
+                    for p in pls.values():
+                        if p["alive"] and p["nick"] in server_accounts:
+                            server_accounts[p["nick"]]["cubixes"] += reward
+
+                    # МЕГА-ХВИЛЯ: Кожні 3 хвилі спавниться 10 евентів одночасно!
+                    if r["wave"] % 3 == 0 and (r["events_survived"] % 5 == 1):
+                        r["is_surge"] = True
+                        r["active_events"] = random.sample(ALL_EVENTS_POOL, min(10, len(ALL_EVENTS_POOL)))
+                    else:
+                        r["is_surge"] = False
+                        # Ліміт евентів: стартує з 3 і щохвилі зростає на +1
+                        max_allowed = 3 + (r["wave"] - 1)
+                        avail = [e for e in ALL_EVENTS_POOL if e not in r["active_events"]]
+                        if avail:
+                            r["active_events"].append(random.choice(avail))
+                        while len(r["active_events"]) > max_allowed:
+                            r["active_events"].pop(0)
 
                 alive_players = [p for p in pls.values() if p["alive"]]
                 all_dead = (len(alive_players) == 0 and n_pls > 0)
                 multi_win = (len(alive_players) == 1 and n_pls > 1)
-                solo_win = (len(alive_players) == 1 and n_pls == 1 and r["events_survived"] >= 10)
 
-                if all_dead or multi_win or solo_win:
+                if all_dead or multi_win:
                     r["state"] = "ROUND_OVER"
                     r["timer"] = 4.0
-                    if multi_win or solo_win:
+                    if multi_win:
                         winner = alive_players[0]
                         server_accounts[winner["nick"]]["cubixes"] += 50
                         server_accounts[winner["nick"]]["wins"] += 1
@@ -258,6 +283,8 @@ async def game_loop():
                     r["timer"] = 8.0
                     r["active_events"] = []
                     r["events_survived"] = 0
+                    r["wave"] = 1
+                    r["is_surge"] = False
                     for p in pls.values():
                         p["alive"] = True
                         p["x"] = random.uniform(-1.0, 1.0)
@@ -272,6 +299,8 @@ async def game_loop():
                 "madness": r["madness"],
                 "events": r["active_events"],
                 "survived": r["events_survived"],
+                "wave": r["wave"],
+                "is_surge": r["is_surge"],
                 "lobby_stats": lobby_stats,
                 "players": {
                     p["nick"]: {
@@ -287,7 +316,7 @@ async def game_loop():
                 await asyncio.gather(*send_tasks, return_exceptions=True)
 
 async def main():
-    print(f"[*] EVENT MADNESS SERVER ONLINE ON PORT {PORT}")
+    print(f"[*] EVENT MADNESS SERVER RUNNING ON PORT {PORT}")
     asyncio.create_task(game_loop())
     async with websockets.serve(handler, HOST, PORT, ping_interval=10, ping_timeout=5):
         await asyncio.Future()
