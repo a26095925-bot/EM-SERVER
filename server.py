@@ -13,7 +13,6 @@ ROOM_NAMES = ["Cube-1", "Cube-2", "Cube-3"]
 
 banned_players = {}
 
-# 37+ БОЖЕВІЛЬНИХ ЕВЕНТІВ
 ALL_EVENTS_POOL = [
     "CUBE_EXPLODE", "CUBE_SHRINK", "CUBE_EXPAND", "BOUNCY_WALLS", "CUBE_TWIST",
     "GRAVITY_UP", "MOON_GRAVITY", "SUPER_SPEED", "ICE_PHYSICS", "HEAVY_WEIGHT",
@@ -52,6 +51,8 @@ async def handler(websocket):
         data = json.loads(raw)
         req_nick = data.get("nick", "Player")
         client_skin = data.get("skin", "Classic")
+        client_prefix = data.get("prefix", "")
+        client_trail = data.get("trail", "None")
         pref_room = data.get("preferred_room", None)
 
         now = time.time()
@@ -59,7 +60,7 @@ async def handler(websocket):
             left_sec = int(banned_players[req_nick] - now)
             await safe_send(websocket, json.dumps({
                 "type": "banned",
-                "msg": f"Античит: Бан! Залишилось {left_sec} сек."
+                "msg": f"Anti-Cheat: Ban active! Remaining {left_sec}s"
             }))
             await websocket.close()
             return
@@ -87,7 +88,13 @@ async def handler(websocket):
         client_nick = req_nick if req_nick not in used_nicks else f"{req_nick}_{random.randint(2,9)}"
 
         if client_nick not in server_accounts:
-            server_accounts[client_nick] = {"coins": data.get("coins", 0), "skins": ["Classic"], "wins": 0}
+            server_accounts[client_nick] = {
+                "cubixes": data.get("cubixes", 0),
+                "skins": ["Classic"],
+                "prefixes": [""],
+                "trails": ["None"],
+                "wins": 0
+            }
 
         is_alive_now = (rooms[room_name]["state"] in ["IDLE", "WAITING"])
 
@@ -97,6 +104,8 @@ async def handler(websocket):
             "y": -2.6,
             "alive": is_alive_now,
             "skin": client_skin,
+            "prefix": client_prefix,
+            "trail": client_trail,
             "air_time": 0.0
         }
 
@@ -121,6 +130,8 @@ async def handler(websocket):
                 if pkt.get("type") == "pos":
                     p["x"] = pkt["x"]
                     p["y"] = pkt["y"]
+                    p["prefix"] = pkt.get("prefix", p["prefix"])
+                    p["trail"] = pkt.get("trail", p["trail"])
                     on_ground = pkt.get("on_ground", False)
                     on_wall = pkt.get("on_wall", False)
 
@@ -130,7 +141,7 @@ async def handler(websocket):
                             banned_players[client_nick] = time.time() + 15.0
                             await safe_send(websocket, json.dumps({
                                 "type": "banned",
-                                "msg": "Античит: Fly-Hack (>7 сек у повітрі)! Бан на 15 сек."
+                                "msg": "Anti-Cheat: Fly-Hack (>7s in air)! 15s Ban."
                             }))
                             await websocket.close()
                             break
@@ -141,15 +152,23 @@ async def handler(websocket):
                     p["alive"] = False
                     p["air_time"] = 0.0
                 elif pkt.get("type") == "chat":
-                    chat_pkt = json.dumps({"type": "chat", "nick": client_nick, "text": pkt["text"]})
+                    chat_pkt = json.dumps({
+                        "type": "chat",
+                        "nick": client_nick,
+                        "prefix": p.get("prefix", ""),
+                        "text": pkt["text"]
+                    })
                     for ws in list(rooms[room_name]["players"].keys()):
                         await safe_send(ws, chat_pkt)
-                elif pkt.get("type") == "buy_skin":
-                    s_name, cost = pkt["skin"], pkt["cost"]
+                elif pkt.get("type") == "buy_item":
+                    category = pkt["category"]
+                    item = pkt["item"]
+                    cost = pkt["cost"]
                     acc = server_accounts[client_nick]
-                    if acc["coins"] >= cost and s_name not in acc["skins"]:
-                        acc["coins"] -= cost
-                        acc["skins"].append(s_name)
+                    if acc["cubixes"] >= cost and item not in acc.get(category, []):
+                        acc["cubixes"] -= cost
+                        if category not in acc: acc[category] = []
+                        acc[category].append(item)
                         await safe_send(websocket, json.dumps({
                             "type": "account_update",
                             "account": acc
@@ -222,7 +241,8 @@ async def game_loop():
                     r["timer"] = 4.0
                     if multi_win or solo_win:
                         winner = alive_players[0]
-                        server_accounts[winner["nick"]]["coins"] += 50
+                        server_accounts[winner["nick"]]["cubixes"] += 50
+                        server_accounts[winner["nick"]]["wins"] += 1
                         for ws, p_data in pls.items():
                             if p_data["nick"] == winner["nick"]:
                                 await safe_send(ws, json.dumps({
@@ -256,7 +276,8 @@ async def game_loop():
                 "players": {
                     p["nick"]: {
                         "x": p["x"], "y": p["y"], "alive": p["alive"],
-                        "skin": p["skin"]
+                        "skin": p["skin"], "prefix": p.get("prefix", ""),
+                        "trail": p.get("trail", "None")
                     } for p in pls.values()
                 }
             })
@@ -266,7 +287,7 @@ async def game_loop():
                 await asyncio.gather(*send_tasks, return_exceptions=True)
 
 async def main():
-    print(f"[*] СЕРВЕР EVENT MADNESS ПРАЦЮЄ НА {PORT}")
+    print(f"[*] EVENT MADNESS SERVER ONLINE ON PORT {PORT}")
     asyncio.create_task(game_loop())
     async with websockets.serve(handler, HOST, PORT, ping_interval=10, ping_timeout=5):
         await asyncio.Future()
