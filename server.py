@@ -26,7 +26,7 @@ ALL_EVENTS_POOL = [
 server_accounts = {}
 rooms = {
     name: {
-        "state": "IDLE",
+        "state": "IDLE", # IDLE, WAITING, IN_GAME, ROUND_OVER
         "timer": 10.0,
         "madness": 0.0,
         "active_events": [],
@@ -55,6 +55,7 @@ async def handler(websocket):
         client_skin = data.get("skin", "Classic")
         client_prefix = data.get("prefix", "")
         client_trail = data.get("trail", "None")
+        client_avatar_b64 = data.get("avatar_b64", "")
         pref_room = data.get("preferred_room", None)
 
         now = time.time()
@@ -67,14 +68,23 @@ async def handler(websocket):
             await websocket.close()
             return
 
+        # SMART MATCHMAKING: 1. Waiting rooms with players -> 2. Empty Idle rooms -> 3. Active in-game rooms (spectate)
         target_room = None
         if pref_room in ROOM_NAMES and len(rooms[pref_room]["players"]) < MAX_PLAYERS:
             target_room = pref_room
         else:
+            # 1. Look for waiting room that already has players
             for r in ROOM_NAMES:
-                if rooms[r]["state"] in ["IDLE", "WAITING"] and len(rooms[r]["players"]) < MAX_PLAYERS:
+                if rooms[r]["state"] == "WAITING" and 0 < len(rooms[r]["players"]) < MAX_PLAYERS:
                     target_room = r
                     break
+            # 2. Look for idle/empty room
+            if not target_room:
+                for r in ROOM_NAMES:
+                    if rooms[r]["state"] in ["IDLE", "WAITING"] and len(rooms[r]["players"]) < MAX_PLAYERS:
+                        target_room = r
+                        break
+            # 3. Fallback: spectate in least populated active room
             if not target_room:
                 for r in ROOM_NAMES:
                     if len(rooms[r]["players"]) < MAX_PLAYERS:
@@ -108,6 +118,7 @@ async def handler(websocket):
             "skin": client_skin,
             "prefix": client_prefix,
             "trail": client_trail,
+            "avatar_b64": client_avatar_b64,
             "air_time": 0.0
         }
 
@@ -136,6 +147,7 @@ async def handler(websocket):
                     p["y"] = pkt["y"]
                     p["prefix"] = pkt.get("prefix", p["prefix"])
                     p["trail"] = pkt.get("trail", p["trail"])
+                    p["avatar_b64"] = pkt.get("avatar_b64", p["avatar_b64"])
                     on_ground = pkt.get("on_ground", False)
                     on_wall = pkt.get("on_wall", False)
 
@@ -155,6 +167,7 @@ async def handler(websocket):
                 elif pkt.get("type") == "dead":
                     p["alive"] = False
                     p["air_time"] = 0.0
+
                 elif pkt.get("type") == "chat":
                     chat_pkt = json.dumps({
                         "type": "chat",
@@ -164,6 +177,7 @@ async def handler(websocket):
                     })
                     for ws in list(rooms[room_name]["players"].keys()):
                         await safe_send(ws, chat_pkt)
+
                 elif pkt.get("type") == "buy_item":
                     category = pkt["category"]
                     item = pkt["item"]
@@ -234,22 +248,19 @@ async def game_loop():
                     r["madness"] = 0.0
                     r["events_survived"] += 1
                     
-                    # Розрахунок Хвилі
                     r["wave"] = 1 + (r["events_survived"] // 5)
                     reward = 25 if (r["events_survived"] % 5 == 0) else 10
 
-                    # Нарахування кубіксів живим гравцям
                     for p in pls.values():
                         if p["alive"] and p["nick"] in server_accounts:
                             server_accounts[p["nick"]]["cubixes"] += reward
 
-                    # МЕГА-ХВИЛЯ: Кожні 3 хвилі спавниться 10 евентів одночасно!
+                    # Mega Surge on every 3rd wave
                     if r["wave"] % 3 == 0 and (r["events_survived"] % 5 == 1):
                         r["is_surge"] = True
                         r["active_events"] = random.sample(ALL_EVENTS_POOL, min(10, len(ALL_EVENTS_POOL)))
                     else:
                         r["is_surge"] = False
-                        # Ліміт евентів: стартує з 3 і щохвилі зростає на +1
                         max_allowed = 3 + (r["wave"] - 1)
                         avail = [e for e in ALL_EVENTS_POOL if e not in r["active_events"]]
                         if avail:
@@ -257,6 +268,7 @@ async def game_loop():
                         while len(r["active_events"]) > max_allowed:
                             r["active_events"].pop(0)
 
+                # Round ends ONLY when 0 or 1 survivor remains!
                 alive_players = [p for p in pls.values() if p["alive"]]
                 all_dead = (len(alive_players) == 0 and n_pls > 0)
                 multi_win = (len(alive_players) == 1 and n_pls > 1)
@@ -306,7 +318,8 @@ async def game_loop():
                     p["nick"]: {
                         "x": p["x"], "y": p["y"], "alive": p["alive"],
                         "skin": p["skin"], "prefix": p.get("prefix", ""),
-                        "trail": p.get("trail", "None")
+                        "trail": p.get("trail", "None"),
+                        "avatar_b64": p.get("avatar_b64", "")
                     } for p in pls.values()
                 }
             })
