@@ -34,6 +34,7 @@ rooms = {
         "events_survived": 0,
         "wave": 1,
         "is_surge": False,
+        "pickups": [{"id": 1, "x": -1.5, "y": -0.5}, {"id": 2, "x": 1.5, "y": -0.5}],
         "players": {}
     } for name in ROOM_NAMES
 }
@@ -70,17 +71,16 @@ async def handler(websocket):
             await websocket.close()
             return
 
-        # CUBE-1 IS EXCLUSIVELY FOR ITCH.IO LOGGED USERS!
-        target_room = None
+        # Cube-1 is locked for Itch users only
         if pref_room == "Cube-1" and not is_itch:
-            pref_room = "Cube-2" # Fallback to Cube-2 if not Itch verified
+            pref_room = "Cube-2"
 
-        if pref_room in ROOM_NAMES and len(rooms[pref_room]["players"]) < MAX_PLAYERS:
+        eligible_rooms = ROOM_NAMES if is_itch else ["Cube-2", "Cube-3"]
+        target_room = None
+
+        if pref_room in eligible_rooms and len(rooms[pref_room]["players"]) < MAX_PLAYERS:
             target_room = pref_room
         else:
-            # Matchmaking: If itch user, can join Cube-1, otherwise only Cube-2/Cube-3
-            eligible_rooms = ROOM_NAMES if is_itch else ["Cube-2", "Cube-3"]
-            
             for r in eligible_rooms:
                 if rooms[r]["state"] == "WAITING" and 0 < len(rooms[r]["players"]) < MAX_PLAYERS:
                     target_room = r
@@ -120,6 +120,8 @@ async def handler(websocket):
             "trail": client_trail,
             "avatar_b64": client_avatar_b64,
             "is_itch": is_itch,
+            "msg_bubble": "",
+            "bubble_time": 0,
             "air_time": 0.0
         }
 
@@ -170,6 +172,21 @@ async def handler(websocket):
                     p["alive"] = False
                     p["air_time"] = 0.0
 
+                elif pkt.get("type") == "bubble":
+                    p["msg_bubble"] = pkt["text"]
+                    p["bubble_time"] = time.time() + 2.5
+
+                elif pkt.get("type") == "emp":
+                    # EMP wave triggered by player
+                    for ws in list(rooms[room_name]["players"].keys()):
+                        await safe_send(ws, json.dumps({"type": "emp_pulse"}))
+
+                elif pkt.get("type") == "pickup_collected":
+                    p_id = pkt.get("id")
+                    rooms[room_name]["pickups"] = [pk for pk in rooms[room_name]["pickups"] if pk["id"] != p_id]
+                    if p["nick"] in server_accounts:
+                        server_accounts[p["nick"]]["cubixes"] += 15
+
                 elif pkt.get("type") == "chat":
                     chat_pkt = json.dumps({
                         "type": "chat",
@@ -181,9 +198,7 @@ async def handler(websocket):
                         await safe_send(ws, chat_pkt)
 
                 elif pkt.get("type") == "buy_item":
-                    category = pkt["category"]
-                    item = pkt["item"]
-                    cost = pkt["cost"]
+                    category, item, cost = pkt["category"], pkt["item"], pkt["cost"]
                     acc = server_accounts[client_nick]
                     if acc["cubixes"] >= cost and item not in acc.get(category, []):
                         acc["cubixes"] -= cost
@@ -245,6 +260,7 @@ async def game_loop():
                         p["air_time"] = 0.0
                     r["active_events"] = [random.choice(ALL_EVENTS_POOL)]
                     r["events_survived"] = 1
+                    r["pickups"] = [{"id": random.randint(10, 999), "x": random.choice([-1.5, 0.0, 1.5]), "y": random.choice([-0.6, 1.1])}]
 
             elif r["state"] == "IN_GAME":
                 r["madness"] = min(100.0, r["madness"] + 0.033 * 8.5)
@@ -252,9 +268,12 @@ async def game_loop():
                 if r["madness"] >= 100.0:
                     r["madness"] = 0.0
                     r["events_survived"] += 1
-                    
                     r["wave"] = 1 + (r["events_survived"] // 5)
                     reward = 25 if (r["events_survived"] % 5 == 0) else 10
+
+                    # Spawn new collectible gems
+                    if random.random() < 0.5:
+                        r["pickups"].append({"id": random.randint(10, 999), "x": random.uniform(-2.0, 2.0), "y": random.choice([-0.6, 1.1])})
 
                     for p in pls.values():
                         if p["alive"] and p["nick"] in server_accounts:
@@ -272,13 +291,14 @@ async def game_loop():
                         while len(r["active_events"]) > max_allowed:
                             r["active_events"].pop(0)
 
+                # Round restart happens ONLY when 0 or 1 survivor remains
                 alive_players = [p for p in pls.values() if p["alive"]]
                 all_dead = (len(alive_players) == 0 and n_pls > 0)
                 multi_win = (len(alive_players) == 1 and n_pls > 1)
 
                 if all_dead or multi_win:
                     r["state"] = "ROUND_OVER"
-                    r["timer"] = 4.0
+                    r["timer"] = 4.5
                     if multi_win:
                         winner = alive_players[0]
                         server_accounts[winner["nick"]]["cubixes"] += 50
@@ -324,6 +344,7 @@ async def game_loop():
                 "survived": r["events_survived"],
                 "wave": r["wave"],
                 "is_surge": r["is_surge"],
+                "pickups": r["pickups"],
                 "lobby_stats": lobby_stats,
                 "players": {
                     p["nick"]: {
@@ -331,6 +352,7 @@ async def game_loop():
                         "skin": p["skin"], "prefix": p.get("prefix", ""),
                         "trail": p.get("trail", "None"),
                         "avatar_b64": p.get("avatar_b64", ""),
+                        "bubble": p["msg_bubble"] if p["bubble_time"] > now else "",
                         "is_itch": p.get("is_itch", False)
                     } for p in pls.values()
                 }
@@ -341,7 +363,7 @@ async def game_loop():
                 await asyncio.gather(*send_tasks, return_exceptions=True)
 
 async def main():
-    print(f"[*] SYNCHRONIZED SERVER RUNNING ON PORT {PORT}")
+    print(f"[*] EVENT MADNESS SERVER ONLINE ON PORT {PORT}")
     asyncio.create_task(game_loop())
     async with websockets.serve(handler, HOST, PORT, ping_interval=10, ping_timeout=5):
         await asyncio.Future()
