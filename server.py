@@ -57,6 +57,7 @@ async def handler(websocket):
         client_prefix = data.get("prefix", "")
         client_trail = data.get("trail", "None")
         client_avatar_b64 = data.get("avatar_b64", "")
+        is_itch = data.get("is_itch", False)
         pref_room = data.get("preferred_room", None)
 
         now = time.time()
@@ -69,26 +70,28 @@ async def handler(websocket):
             await websocket.close()
             return
 
+        # CUBE-1 IS EXCLUSIVELY FOR ITCH.IO LOGGED USERS!
         target_room = None
+        if pref_room == "Cube-1" and not is_itch:
+            pref_room = "Cube-2" # Fallback to Cube-2 if not Itch verified
+
         if pref_room in ROOM_NAMES and len(rooms[pref_room]["players"]) < MAX_PLAYERS:
             target_room = pref_room
         else:
-            for r in ROOM_NAMES:
+            # Matchmaking: If itch user, can join Cube-1, otherwise only Cube-2/Cube-3
+            eligible_rooms = ROOM_NAMES if is_itch else ["Cube-2", "Cube-3"]
+            
+            for r in eligible_rooms:
                 if rooms[r]["state"] == "WAITING" and 0 < len(rooms[r]["players"]) < MAX_PLAYERS:
                     target_room = r
                     break
             if not target_room:
-                for r in ROOM_NAMES:
+                for r in eligible_rooms:
                     if rooms[r]["state"] in ["IDLE", "WAITING"] and len(rooms[r]["players"]) < MAX_PLAYERS:
                         target_room = r
                         break
             if not target_room:
-                for r in ROOM_NAMES:
-                    if len(rooms[r]["players"]) < MAX_PLAYERS:
-                        target_room = r
-                        break
-            if not target_room:
-                target_room = ROOM_NAMES[0]
+                target_room = eligible_rooms[0]
 
         room_name = target_room
         client_rooms[websocket] = room_name
@@ -116,6 +119,7 @@ async def handler(websocket):
             "prefix": client_prefix,
             "trail": client_trail,
             "avatar_b64": client_avatar_b64,
+            "is_itch": is_itch,
             "air_time": 0.0
         }
 
@@ -207,7 +211,8 @@ async def game_loop():
             r_name: {
                 "players": f"{len(r['players'])}/{MAX_PLAYERS}",
                 "state": r["state"],
-                "events_count": len(r["active_events"])
+                "events_count": len(r["active_events"]),
+                "itch_only": (r_name == "Cube-1")
             } for r_name, r in rooms.items()
         }
 
@@ -325,7 +330,8 @@ async def game_loop():
                         "x": p["x"], "y": p["y"], "alive": p["alive"],
                         "skin": p["skin"], "prefix": p.get("prefix", ""),
                         "trail": p.get("trail", "None"),
-                        "avatar_b64": p.get("avatar_b64", "")
+                        "avatar_b64": p.get("avatar_b64", ""),
+                        "is_itch": p.get("is_itch", False)
                     } for p in pls.values()
                 }
             })
@@ -335,7 +341,7 @@ async def game_loop():
                 await asyncio.gather(*send_tasks, return_exceptions=True)
 
 async def main():
-    print(f"[*] EVENT MADNESS SERVER ONLINE ON PORT {PORT}")
+    print(f"[*] SYNCHRONIZED SERVER RUNNING ON PORT {PORT}")
     asyncio.create_task(game_loop())
     async with websockets.serve(handler, HOST, PORT, ping_interval=10, ping_timeout=5):
         await asyncio.Future()
