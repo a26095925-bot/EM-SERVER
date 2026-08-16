@@ -26,7 +26,8 @@ ALL_EVENTS_POOL = [
 server_accounts = {}
 rooms = {
     name: {
-        "state": "IDLE", # IDLE, WAITING, IN_GAME, ROUND_OVER
+        "state": "IDLE",
+        "start_time": time.time(),
         "timer": 10.0,
         "madness": 0.0,
         "active_events": [],
@@ -68,23 +69,19 @@ async def handler(websocket):
             await websocket.close()
             return
 
-        # SMART MATCHMAKING: 1. Waiting rooms with players -> 2. Empty Idle rooms -> 3. Active in-game rooms (spectate)
         target_room = None
         if pref_room in ROOM_NAMES and len(rooms[pref_room]["players"]) < MAX_PLAYERS:
             target_room = pref_room
         else:
-            # 1. Look for waiting room that already has players
             for r in ROOM_NAMES:
                 if rooms[r]["state"] == "WAITING" and 0 < len(rooms[r]["players"]) < MAX_PLAYERS:
                     target_room = r
                     break
-            # 2. Look for idle/empty room
             if not target_room:
                 for r in ROOM_NAMES:
                     if rooms[r]["state"] in ["IDLE", "WAITING"] and len(rooms[r]["players"]) < MAX_PLAYERS:
                         target_room = r
                         break
-            # 3. Fallback: spectate in least populated active room
             if not target_room:
                 for r in ROOM_NAMES:
                     if len(rooms[r]["players"]) < MAX_PLAYERS:
@@ -124,6 +121,7 @@ async def handler(websocket):
 
         if rooms[room_name]["state"] == "IDLE":
             rooms[room_name]["state"] = "WAITING"
+            rooms[room_name]["start_time"] = time.time()
             rooms[room_name]["timer"] = 10.0
             rooms[room_name]["events_survived"] = 0
             rooms[room_name]["wave"] = 1
@@ -203,6 +201,7 @@ async def handler(websocket):
 async def game_loop():
     while True:
         await asyncio.sleep(0.033)
+        now = time.time()
 
         lobby_stats = {
             r_name: {
@@ -235,6 +234,7 @@ async def game_loop():
                 r["timer"] -= 0.033
                 if r["timer"] <= 0 or n_pls >= MAX_PLAYERS:
                     r["state"] = "IN_GAME"
+                    r["start_time"] = time.time()
                     for p in pls.values():
                         p["alive"] = True
                         p["air_time"] = 0.0
@@ -255,7 +255,6 @@ async def game_loop():
                         if p["alive"] and p["nick"] in server_accounts:
                             server_accounts[p["nick"]]["cubixes"] += reward
 
-                    # Mega Surge on every 3rd wave
                     if r["wave"] % 3 == 0 and (r["events_survived"] % 5 == 1):
                         r["is_surge"] = True
                         r["active_events"] = random.sample(ALL_EVENTS_POOL, min(10, len(ALL_EVENTS_POOL)))
@@ -268,7 +267,6 @@ async def game_loop():
                         while len(r["active_events"]) > max_allowed:
                             r["active_events"].pop(0)
 
-                # Round ends ONLY when 0 or 1 survivor remains!
                 alive_players = [p for p in pls.values() if p["alive"]]
                 all_dead = (len(alive_players) == 0 and n_pls > 0)
                 multi_win = (len(alive_players) == 1 and n_pls > 1)
@@ -292,6 +290,7 @@ async def game_loop():
                 r["timer"] -= 0.033
                 if r["timer"] <= 0:
                     r["state"] = "WAITING"
+                    r["start_time"] = time.time()
                     r["timer"] = 8.0
                     r["active_events"] = []
                     r["events_survived"] = 0
@@ -303,10 +302,18 @@ async def game_loop():
                         p["y"] = -2.6
                         p["air_time"] = 0.0
 
+            # Synchronized Laser parameters calculated by server clock
+            elapsed = now - r["start_time"]
+            server_laser_timer = elapsed % 5.5
+            server_laser_mode = int((elapsed // 5.5) % 3)
+
             packet = json.dumps({
                 "type": "sync",
                 "state": r["state"],
                 "room": r_name,
+                "server_time": now,
+                "laser_timer": server_laser_timer,
+                "laser_mode": server_laser_mode,
                 "timer": max(0, int(r["timer"])),
                 "madness": r["madness"],
                 "events": r["active_events"],
@@ -329,7 +336,7 @@ async def game_loop():
                 await asyncio.gather(*send_tasks, return_exceptions=True)
 
 async def main():
-    print(f"[*] EVENT MADNESS SERVER RUNNING ON PORT {PORT}")
+    print(f"[*] SYNCHRONIZED SERVER RUNNING ON PORT {PORT}")
     asyncio.create_task(game_loop())
     async with websockets.serve(handler, HOST, PORT, ping_interval=10, ping_timeout=5):
         await asyncio.Future()
