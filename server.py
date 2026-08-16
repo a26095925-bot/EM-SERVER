@@ -8,32 +8,26 @@ import random
 PORT = int(os.environ.get("PORT", 10000))
 HOST = "0.0.0.0"
 
-MAX_PLAYERS = 5
-ROOM_NAMES = ["Cube-1", "Cube-2", "Cube-3"]
+# 5 кімнат 1v1 + 2 кімнати 1v1v1
+ROOMS_CONFIG = {
+    "Duel-1": 2, "Duel-2": 2, "Duel-3": 2, "Duel-4": 2, "Duel-5": 2,
+    "Standoff-1": 3, "Standoff-2": 3
+}
+ROOM_NAMES = list(ROOMS_CONFIG.keys())
 
-ALL_EVENTS_POOL = [
-    "CUBE_EXPLODE", "CUBE_SHRINK", "CUBE_EXPAND", "BOUNCY_WALLS", "CUBE_TWIST",
-    "GRAVITY_UP", "MOON_GRAVITY", "SUPER_SPEED", "ICE_PHYSICS", "HEAVY_WEIGHT",
-    "INVERT_KEYS", "HYPER_JUMP", "SLOW_MO", "DARKNESS", "SCREEN_SHAKE",
-    "RED_ALERT", "COLOR_MADNESS", "METEOR_STORM", "GRAVITY_LEFT", "GRAVITY_RIGHT"
-]
-
+banned_players = {}
 server_accounts = {}
+
 rooms = {
     name: {
-        "state": "IDLE",
-        "mode": "BATTLE", # BATTLE, SPEEDRUN, SHERIFF
-        "start_time": time.time(),
-        "timer": 10.0,
-        "madness": 0.0,
-        "active_events": [],
-        "battle_task": "CEILING_SMASH",
-        "task_timer": 8.0,
-        "sheriff_draw_time": 0.0,
-        "sheriff_can_shoot": False,
-        "speedrun_checkpoint": 1,
+        "state": "IDLE", # IDLE, WAITING, STANDOFF_WALK, COUNTDOWN, DUEL_COMBAT, ROUND_OVER
+        "max_players": max_p,
+        "timer": 4.0,
+        "countdown": 3,
+        "first_draw_winner": None,
+        "is_bot_match": False,
         "players": {}
-    } for name in ROOM_NAMES
+    } for name, max_p in ROOMS_CONFIG.items()
 }
 client_rooms = {}
 
@@ -50,20 +44,35 @@ async def handler(websocket):
     try:
         raw = await websocket.recv()
         data = json.loads(raw)
-        req_nick = data.get("nick", "Player")
+        req_nick = data.get("nick", "Cowboy")
         client_skin = data.get("skin", "Classic")
         client_prefix = data.get("prefix", "")
-        client_trail = data.get("trail", "None")
         client_avatar_b64 = data.get("avatar_b64", "")
         is_itch = data.get("is_itch", False)
         pref_room = data.get("preferred_room", None)
-        req_mode = data.get("mode", "BATTLE")
 
-        if pref_room == "Cube-1" and not is_itch:
-            pref_room = "Cube-2"
+        now = time.time()
+        if req_nick in banned_players and banned_players[req_nick] > now:
+            left_sec = int(banned_players[req_nick] - now)
+            await safe_send(websocket, json.dumps({
+                "type": "banned",
+                "msg": f"Banned! Remaining {left_sec}s"
+            }))
+            await websocket.close()
+            return
 
-        eligible_rooms = ROOM_NAMES if is_itch else ["Cube-2", "Cube-3"]
-        target_room = pref_room if pref_room in eligible_rooms and len(rooms[pref_room]["players"]) < MAX_PLAYERS else eligible_rooms[0]
+        target_room = None
+        if pref_room in ROOM_NAMES and len(rooms[pref_room]["players"]) < rooms[pref_room]["max_players"]:
+            target_room = pref_room
+        else:
+            for r in ROOM_NAMES:
+                if rooms[r]["state"] == "WAITING" and len(rooms[r]["players"]) < rooms[r]["max_players"]:
+                    target_room = r; break
+            if not target_room:
+                for r in ROOM_NAMES:
+                    if rooms[r]["state"] in ["IDLE", "WAITING"] and len(rooms[r]["players"]) < rooms[r]["max_players"]:
+                        target_room = r; break
+            if not target_room: target_room = ROOM_NAMES[0]
 
         room_name = target_room
         client_rooms[websocket] = room_name
@@ -72,29 +81,26 @@ async def handler(websocket):
         client_nick = req_nick if req_nick not in used_nicks else f"{req_nick}_{random.randint(2,9)}"
 
         if client_nick not in server_accounts:
-            server_accounts[client_nick] = {"cubixes": data.get("cubixes", 0), "skins": ["Classic"], "prefixes": [""], "trails": ["None"], "wins": 0}
+            server_accounts[client_nick] = {"cubixes": data.get("cubixes", 0), "skins": ["Classic"], "prefixes": [""], "wins": 0}
 
-        rooms[room_name]["mode"] = req_mode
-        is_alive_now = (rooms[room_name]["state"] in ["IDLE", "WAITING"])
+        spawn_x = -2.2 if len(rooms[room_name]["players"]) == 0 else 2.2
 
         rooms[room_name]["players"][websocket] = {
             "nick": client_nick,
-            "x": random.uniform(-1.5, 1.5),
-            "y": -4.2,
+            "x": spawn_x,
+            "y": -2.6,
             "hp": 100,
-            "alive": is_alive_now,
+            "alive": True,
             "skin": client_skin,
             "prefix": client_prefix,
-            "trail": client_trail,
             "avatar_b64": client_avatar_b64,
-            "is_itch": is_itch,
-            "air_time": 0.0
+            "is_itch": is_itch
         }
 
         if rooms[room_name]["state"] == "IDLE":
             rooms[room_name]["state"] = "WAITING"
-            rooms[room_name]["start_time"] = time.time()
-            rooms[room_name]["timer"] = 10.0
+            rooms[room_name]["timer"] = 6.0
+            rooms[room_name]["is_bot_match"] = False
 
         await safe_send(websocket, json.dumps({
             "type": "init",
@@ -114,30 +120,36 @@ async def handler(websocket):
                     p["y"] = pkt["y"]
                     p["hp"] = pkt.get("hp", p["hp"])
 
-                elif pkt.get("type") == "damage_all":
-                    dmg = pkt.get("dmg", 35)
-                    for ws_other, p_other in rooms[room_name]["players"].items():
-                        if p_other["nick"] != client_nick and p_other["alive"]:
-                            p_other["hp"] = max(0, p_other["hp"] - dmg)
-                            if p_other["hp"] <= 0: p_other["alive"] = False
+                elif pkt.get("type") == "start_bot":
+                    rooms[room_name]["is_bot_match"] = True
+                    rooms[room_name]["state"] = "STANDOFF_WALK"
+                    rooms[room_name]["timer"] = 3.0
 
-                elif pkt.get("type") == "speedrun_win":
-                    rooms[room_name]["state"] = "ROUND_OVER"
-                    rooms[room_name]["timer"] = 4.0
-                    server_accounts[client_nick]["cubixes"] += 50
-                    server_accounts[client_nick]["wins"] += 1
-                    await safe_send(websocket, json.dumps({"type": "account_update", "account": server_accounts[client_nick], "win": True}))
+                elif pkt.get("type") == "quick_draw_claim":
+                    if rooms[room_name]["state"] == "COUNTDOWN" and rooms[room_name]["countdown"] <= 0:
+                        if not rooms[room_name]["first_draw_winner"]:
+                            rooms[room_name]["first_draw_winner"] = client_nick
+                            for ws_c in list(rooms[room_name]["players"].keys()):
+                                await safe_send(ws_c, json.dumps({"type": "quick_draw_awarded", "winner": client_nick}))
 
-                elif pkt.get("type") == "sheriff_shot":
-                    if rooms[room_name]["sheriff_can_shoot"] and rooms[room_name]["state"] == "IN_GAME":
-                        # First valid shot wins duel
-                        rooms[room_name]["state"] = "ROUND_OVER"
-                        rooms[room_name]["timer"] = 4.0
-                        server_accounts[client_nick]["cubixes"] += 50
-                        server_accounts[client_nick]["wins"] += 1
-                        for ws_o, po in rooms[room_name]["players"].items():
-                            if po["nick"] != client_nick: po["alive"] = False; po["hp"] = 0
-                        await safe_send(websocket, json.dumps({"type": "account_update", "account": server_accounts[client_nick], "win": True}))
+                elif pkt.get("type") == "bullet_fired":
+                    # Broadcast bullet tracer to room
+                    bullet_pkt = json.dumps({
+                        "type": "bullet_tracer",
+                        "from_x": pkt["from_x"], "from_y": pkt["from_y"],
+                        "dir_x": pkt["dir_x"], "dir_y": pkt["dir_y"],
+                        "shooter": client_nick
+                    })
+                    for ws_c in list(rooms[room_name]["players"].keys()):
+                        await safe_send(ws_c, bullet_pkt)
+
+                elif pkt.get("type") == "hit_damage":
+                    target_nick = pkt.get("target")
+                    dmg = pkt.get("dmg", 45)
+                    for ws_c, po in rooms[room_name]["players"].items():
+                        if po["nick"] == target_nick and po["alive"]:
+                            po["hp"] = max(0, po["hp"] - dmg)
+                            if po["hp"] <= 0: po["alive"] = False
 
                 elif pkt.get("type") == "dead":
                     p["alive"] = False
@@ -145,17 +157,8 @@ async def handler(websocket):
 
                 elif pkt.get("type") == "chat":
                     chat_pkt = json.dumps({"type": "chat", "nick": client_nick, "prefix": p.get("prefix", ""), "text": pkt["text"]})
-                    for ws in list(rooms[room_name]["players"].keys()):
-                        await safe_send(ws, chat_pkt)
-
-                elif pkt.get("type") == "buy_item":
-                    category, item, cost = pkt["category"], pkt["item"], pkt["cost"]
-                    acc = server_accounts[client_nick]
-                    if acc["cubixes"] >= cost and item not in acc.get(category, []):
-                        acc["cubixes"] -= cost
-                        if category not in acc: acc[category] = []
-                        acc[category].append(item)
-                        await safe_send(websocket, json.dumps({"type": "account_update", "account": acc}))
+                    for ws_c in list(rooms[room_name]["players"].keys()):
+                        await safe_send(ws_c, chat_pkt)
             except: pass
     except: pass
     finally:
@@ -170,95 +173,98 @@ async def game_loop():
         await asyncio.sleep(0.033)
         now = time.time()
 
+        lobby_stats = {
+            r_name: {
+                "players": f"{len(r['players'])}/{r['max_players']}",
+                "state": r["state"],
+                "max": r["max_players"]
+            } for r_name, r in rooms.items()
+        }
+
         for r_name, r in rooms.items():
             pls = r["players"]
             n_pls = len(pls)
 
             if n_pls == 0:
                 r["state"] = "IDLE"
-                r["timer"] = 10.0
+                r["timer"] = 5.0
+                r["is_bot_match"] = False
                 continue
 
             if r["state"] == "WAITING":
+                if not r["is_bot_match"]:
+                    if n_pls >= r["max_players"]:
+                        r["state"] = "STANDOFF_WALK"
+                        r["timer"] = 3.0
+                        r["first_draw_winner"] = None
+                        for p in pls.values(): p["alive"] = True; p["hp"] = 100
+
+            elif r["state"] == "STANDOFF_WALK":
                 r["timer"] -= 0.033
-                if r["timer"] <= 0 or n_pls >= MAX_PLAYERS:
-                    r["state"] = "IN_GAME"
-                    r["start_time"] = time.time()
-                    for p in pls.values():
-                        p["alive"] = True
-                        p["hp"] = 100
-                    r["active_events"] = [random.choice(ALL_EVENTS_POOL)]
-                    
-                    if r["mode"] == "SHERIFF":
-                        r["sheriff_draw_time"] = now + random.uniform(3.5, 7.0)
-                        r["sheriff_can_shoot"] = False
-                    elif r["mode"] == "BATTLE":
-                        r["battle_task"] = random.choice(["CEILING_SMASH", "CLICK_CLASH", "GROUND_STOMP"])
-                        r["task_timer"] = 10.0
+                if r["timer"] <= 0:
+                    r["state"] = "COUNTDOWN"
+                    r["countdown"] = 3
+                    r["timer"] = 1.0
 
-            elif r["state"] == "IN_GAME":
-                # Mode specific logic
-                if r["mode"] == "SHERIFF":
-                    if now >= r["sheriff_draw_time"]:
-                        r["sheriff_can_shoot"] = True
+            elif r["state"] == "COUNTDOWN":
+                r["timer"] -= 0.033
+                if r["timer"] <= 0:
+                    r["countdown"] -= 1
+                    r["timer"] = 1.0
+                    if r["countdown"] < 0:
+                        r["state"] = "DUEL_COMBAT"
+                        r["timer"] = 60.0
 
-                elif r["mode"] == "BATTLE":
-                    r["task_timer"] -= 0.033
-                    if r["task_timer"] <= 0:
-                        r["task_timer"] = 10.0
-                        r["battle_task"] = random.choice(["CEILING_SMASH", "CLICK_CLASH", "GROUND_STOMP"])
-
-                # Check survivors in battle
-                if r["mode"] == "BATTLE":
-                    alive_pls = [p for p in pls.values() if p["alive"] and p["hp"] > 0]
-                    if (len(alive_pls) == 1 and n_pls > 1) or (len(alive_pls) == 0 and n_pls > 0):
-                        r["state"] = "ROUND_OVER"
-                        r["timer"] = 4.0
-                        if len(alive_pls) == 1:
-                            w = alive_pls[0]
-                            server_accounts[w["nick"]]["cubixes"] += 50
-                            server_accounts[w["nick"]]["wins"] += 1
-                            for ws, p in pls.items():
-                                if p["nick"] == w["nick"]:
-                                    await safe_send(ws, json.dumps({"type": "account_update", "account": server_accounts[w["nick"]], "win": True}))
+            elif r["state"] == "DUEL_COMBAT":
+                r["timer"] -= 0.033
+                alive_pls = [p for p in pls.values() if p["alive"] and p["hp"] > 0]
+                
+                # Check duel victory
+                if (len(alive_pls) == 1 and n_pls > 1) or (len(alive_pls) == 0 and n_pls > 0) or r["timer"] <= 0:
+                    r["state"] = "ROUND_OVER"
+                    r["timer"] = 4.0
+                    if len(alive_pls) == 1:
+                        winner = alive_pls[0]
+                        if winner["nick"] in server_accounts:
+                            server_accounts[winner["nick"]]["cubixes"] += 50
+                            server_accounts[winner["nick"]]["wins"] += 1
+                            for ws_c, po in pls.items():
+                                if po["nick"] == winner["nick"]:
+                                    await safe_send(ws_c, json.dumps({"type": "account_update", "account": server_accounts[winner["nick"]], "win": True}))
 
             elif r["state"] == "ROUND_OVER":
                 r["timer"] -= 0.033
                 if r["timer"] <= 0:
-                    r["state"] = "WAITING"
-                    r["timer"] = 6.0
-                    for p in pls.values():
-                        p["alive"] = True
-                        p["hp"] = 100
-                        p["x"] = random.uniform(-1.5, 1.5)
-                        p["y"] = -4.2
+                    r["state"] = "STANDOFF_WALK"
+                    r["timer"] = 3.0
+                    r["first_draw_winner"] = None
+                    for po in pls.values():
+                        po["alive"] = True
+                        po["hp"] = 100
 
             packet = json.dumps({
                 "type": "sync",
                 "state": r["state"],
-                "mode": r["mode"],
                 "room": r_name,
                 "server_time": now,
                 "timer": max(0, int(r["timer"])),
-                "battle_task": r.get("battle_task", "CEILING_SMASH"),
-                "task_timer": max(0, int(r.get("task_timer", 0))),
-                "sheriff_can_shoot": r.get("sheriff_can_shoot", False),
-                "events": r["active_events"],
+                "countdown": r["countdown"],
+                "is_bot_match": r["is_bot_match"],
+                "lobby_stats": lobby_stats,
                 "players": {
-                    p["nick"]: {
-                        "x": p["x"], "y": p["y"], "hp": p["hp"], "alive": p["alive"],
-                        "skin": p["skin"], "prefix": p.get("prefix", ""),
-                        "avatar_b64": p.get("avatar_b64", "")
-                    } for p in pls.values()
+                    po["nick"]: {
+                        "x": po["x"], "y": po["y"], "hp": po["hp"], "alive": po["alive"],
+                        "skin": po["skin"], "prefix": po.get("prefix", ""),
+                        "avatar_b64": po.get("avatar_b64", "")
+                    } for po in pls.values()
                 }
             })
 
-            send_tasks = [safe_send(ws, packet) for ws in list(pls.keys())]
-            if send_tasks:
-                await asyncio.gather(*send_tasks, return_exceptions=True)
+            send_tasks = [safe_send(ws_c, packet) for ws_c in list(pls.keys())]
+            if send_tasks: await asyncio.gather(*send_tasks, return_exceptions=True)
 
 async def main():
-    print(f"[*] MULTI-MODE SERVER ONLINE ON PORT {PORT}")
+    print(f"[*] WESTERN DUEL SERVER ONLINE ON PORT {PORT}")
     asyncio.create_task(game_loop())
     async with websockets.serve(handler, HOST, PORT, ping_interval=10, ping_timeout=5):
         await asyncio.Future()
