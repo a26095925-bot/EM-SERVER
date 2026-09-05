@@ -17,7 +17,11 @@ sio.attach(app)
 PORT = int(os.environ.get('PORT', 3000))
 MAP_SIZE = 5000
 
-registered_users = {}
+registered_users = {}  # { username: { password, clan } }
+clans = {
+    'ALPHA': {'tag': 'ALPHA', 'name': 'Альфа Загін', 'leader': 'Admin', 'desc': 'Елітні бійці сектору', 'members': []},
+    'OMEGA': {'tag': 'OMEGA', 'name': 'Омега Рейдери', 'leader': 'Admin', 'desc': 'Знищуємо все на шляху', 'members': []}
+}
 
 game_state = {
     'players': {},
@@ -29,10 +33,8 @@ game_state = {
     'events': []
 }
 
-# Генерація світу
 def init_world():
-    # Дерева та каміння
-    for _ in range(140):
+    for _ in range(150):
         game_state['resources'].append({
             'id': random.random(),
             'x': random.randint(150, MAP_SIZE - 150),
@@ -42,7 +44,6 @@ def init_world():
             'maxHp': 100,
             'size': random.randint(28, 42)
         })
-    # Скрині з лутом
     for _ in range(50):
         game_state['chests'].append({
             'id': random.random(),
@@ -51,13 +52,12 @@ def init_world():
             'opened': False,
             'respawnTimer': 0
         })
-    # Боти із розумним ШІ
     bot_types = [
         {'type': 'raider', 'hp': 80, 'weapon': 'rifle', 'name': 'Рейдер-Бот'},
         {'type': 'cyborg', 'hp': 140, 'weapon': 'minigun', 'name': 'Кіборг-Вартовий'},
-        {'type': 'berserk', 'hp': 100, 'weapon': 'stick', 'name': 'Дикун-Берсерк'}
+        {'type': 'berserk', 'hp': 100, 'weapon': 'pickaxe', 'name': 'Дикун-Берсерк'}
     ]
-    for i in range(18):
+    for i in range(20):
         cfg = random.choice(bot_types)
         game_state['bots'].append({
             'id': f'bot_{i}',
@@ -78,30 +78,50 @@ def init_world():
 
 init_world()
 
-SPECIAL_WEAPONS = ['banana', 'boomerang', 'eye_laser', 'water_pistol', 'nuke_remote', 'minigun', 'rifle']
+SPECIAL_WEAPONS = ['banana', 'boomerang', 'eye_laser', 'water_pistol', 'nuke_remote', 'minigun']
 
-@sio.event
-async def connect(sid, environ):
-    pass
+def add_xp(p, amount):
+    p['xp'] += amount
+    if p['xp'] >= p['xpToNext']:
+        p['xp'] -= p['xpToNext']
+        p['level'] += 1
+        p['statPoints'] += 1
+        p['xpToNext'] = int(p['xpToNext'] * 1.4)
+        p['hp'] = p['maxHp']
+        game_state['events'].append({'type': 'level_up', 'x': p['x'], 'y': p['y'], 'lvl': p['level']})
 
 @sio.event
 async def loginPlayer(sid, data):
-    username = (data.get('username') or 'Мандрівник')[:14].strip()
+    username = (data.get('username') or 'Боєць')[:14].strip()
     password = data.get('password') or ''
-    clan = (data.get('clan') or '').upper()[:6].strip()
+    clan_tag = (data.get('clan') or '').upper()[:6].strip()
 
     if username in registered_users:
         if registered_users[username]['password'] != password:
             await sio.emit('authError', 'Невірний пароль для цього нікнейму!', room=sid)
             return
-        clan = registered_users[username]['clan']
+        clan_tag = registered_users[username]['clan']
     else:
-        registered_users[username] = {'password': password, 'clan': clan}
+        registered_users[username] = {'password': password, 'clan': clan_tag}
+
+    if clan_tag and clan_tag in clans:
+        if username not in clans[clan_tag]['members']:
+            clans[clan_tag]['members'].append(username)
+
+    # Початковий інвентар/хотбар
+    hotbar = [
+        {'slot': 0, 'type': 'pickaxe', 'name': 'Кирка/Сокира', 'icon': '⛏️'},
+        {'slot': 1, 'type': 'rifle', 'name': 'Автомат M4', 'icon': '🔫'},
+        {'slot': 2, 'type': 'banana', 'name': 'Банан-Бумеранг', 'icon': '🍌'},
+        {'slot': 3, 'type': 'wall', 'name': 'Стіна', 'icon': '🧱', 'count': 5},
+        {'slot': 4, 'type': 'medkit', 'name': 'Аптечка', 'icon': '💉', 'count': 2},
+        {'slot': 5, 'type': 'empty', 'name': 'Порожньо', 'icon': '▫️'}
+    ]
 
     game_state['players'][sid] = {
         'id': sid,
         'name': username,
-        'clan': clan,
+        'clan': clan_tag,
         'x': random.randint(1200, MAP_SIZE - 1200),
         'y': random.randint(1200, MAP_SIZE - 1200),
         'angle': 0,
@@ -109,18 +129,43 @@ async def loginPlayer(sid, data):
         'maxHp': 100,
         'armor': 0,
         'isAlive': True,
-        'wood': 40,
-        'stone': 25,
-        'scrap': 15,
-        'wallKits': 3,
-        'medkits': 1,
-        'weapon': 'stick',
-        'ammo': 30,
-        'maxAmmo': 30,
+        # Прокачка
+        'level': 1,
+        'xp': 0,
+        'xpToNext': 100,
+        'statPoints': 0,
+        'stats': {'hp': 0, 'speed': 0, 'damage': 0, 'gather': 0},
+        # Ресурси
+        'wood': 50,
+        'stone': 30,
+        'scrap': 20,
+        'hotbar': hotbar,
+        'activeSlot': 0,
+        'ammo': 40,
+        'maxAmmo': 40,
         'shootCd': 0,
-        'dashCd': 0
+        'dashCd': 0,
+        'chatMsg': '',
+        'chatTimer': 0
     }
-    await sio.emit('authSuccess', {'id': sid, 'player': game_state['players'][sid]}, room=sid)
+    await sio.emit('authSuccess', {'id': sid, 'player': game_state['players'][sid], 'clans': clans}, room=sid)
+
+@sio.event
+async def selectSlot(sid, slot_idx):
+    p = game_state['players'].get(sid)
+    if p and 0 <= slot_idx < len(p['hotbar']):
+        p['activeSlot'] = slot_idx
+
+@sio.event
+async def upgradeStat(sid, stat_name):
+    p = game_state['players'].get(sid)
+    if p and p['statPoints'] > 0 and stat_name in p['stats']:
+        p['statPoints'] -= 1
+        p['stats'][stat_name] += 1
+        if stat_name == 'hp':
+            p['maxHp'] += 20
+            p['hp'] += 20
+        game_state['events'].append({'type': 'floatText', 'x': p['x'], 'y': p['y'] - 30, 'text': f"+1 {stat_name.upper()}!", 'color': '#38bdf8'})
 
 @sio.event
 async def playerInput(sid, data):
@@ -131,7 +176,9 @@ async def playerInput(sid, data):
     p['angle'] = data.get('angle', 0)
     keys = data.get('keys', {})
     stick = data.get('joystick', {'x': 0, 'y': 0})
-    speed = 4.4
+    
+    speed_boost = p['stats']['speed'] * 0.35
+    speed = 4.4 + speed_boost
 
     vx = (1 if keys.get('d') else 0) - (1 if keys.get('a') else 0) + stick.get('x', 0)
     vy = (1 if keys.get('s') else 0) - (1 if keys.get('w') else 0) + stick.get('y', 0)
@@ -140,10 +187,12 @@ async def playerInput(sid, data):
     if length > 0:
         p['x'] += (vx / length) * speed
         p['y'] += (vy / length) * speed
+        if random.random() < 0.25:
+            game_state['events'].append({'type': 'step_dust', 'x': p['x'], 'y': p['y']})
 
     if data.get('isDash') and p['dashCd'] <= 0:
-        p['x'] += math.cos(p['angle']) * 85
-        p['y'] += math.sin(p['angle']) * 85
+        p['x'] += math.cos(p['angle']) * 90
+        p['y'] += math.sin(p['angle']) * 90
         p['dashCd'] = 55
         game_state['events'].append({'type': 'dash', 'x': p['x'], 'y': p['y']})
 
@@ -152,32 +201,44 @@ async def playerInput(sid, data):
 
     if p['dashCd'] > 0:
         p['dashCd'] -= 1
+    if p['chatTimer'] > 0:
+        p['chatTimer'] -= 1
 
     if data.get('isShooting') and p['shootCd'] <= 0:
-        await handle_shooting(p)
+        await handle_action(p)
 
     if p['shootCd'] > 0:
         p['shootCd'] -= 1
 
-async def handle_shooting(p):
-    w = p['weapon']
-    if w == 'stick':
-        p['shootCd'] = 14
+async def handle_action(p):
+    item = p['hotbar'][p['activeSlot']]
+    itype = item['type']
+    dmg_mult = 1.0 + p['stats']['damage'] * 0.15
+    gather_mult = 1.0 + p['stats']['gather'] * 0.25
+
+    if itype == 'pickaxe':
+        p['shootCd'] = 12
         hit_range = 60
         target_x = p['x'] + math.cos(p['angle']) * hit_range
         target_y = p['y'] + math.sin(p['angle']) * hit_range
 
-        # Добування ресурсів
+        # Видобуток ресурсів
         for res in game_state['resources']:
             if math.hypot(res['x'] - target_x, res['y'] - target_y) < (res.get('size', 32) + 15):
-                res['hp'] -= 35
+                res['hp'] -= 35 * gather_mult
                 if res['type'] == 'wood':
-                    p['wood'] += 15
-                    game_state['events'].append({'type': 'floatText', 'x': res['x'], 'y': res['y'], 'text': '+15 🪵', 'color': '#c28b57'})
+                    gain = int(15 * gather_mult)
+                    p['wood'] += gain
+                    add_xp(p, 8)
+                    game_state['events'].append({'type': 'floatText', 'x': res['x'], 'y': res['y'], 'text': f'+{gain} 🪵', 'color': '#c28b57'})
+                    game_state['events'].append({'type': 'tree_chips', 'x': target_x, 'y': target_y})
                 else:
-                    p['stone'] += 15
-                    game_state['events'].append({'type': 'floatText', 'x': res['x'], 'y': res['y'], 'text': '+15 🪨', 'color': '#a3a3a3'})
-                game_state['events'].append({'type': 'hit_res', 'x': res['x'], 'y': res['y']})
+                    gain = int(15 * gather_mult)
+                    p['stone'] += gain
+                    add_xp(p, 8)
+                    game_state['events'].append({'type': 'floatText', 'x': res['x'], 'y': res['y'], 'text': f'+{gain} 🪨', 'color': '#a3a3a3'})
+                    game_state['events'].append({'type': 'stone_sparks', 'x': target_x, 'y': target_y})
+                
                 if res['hp'] <= 0:
                     res['x'] = random.randint(100, MAP_SIZE - 100)
                     res['y'] = random.randint(100, MAP_SIZE - 100)
@@ -187,50 +248,75 @@ async def handle_shooting(p):
         # Удар по ботах
         for bot in game_state['bots']:
             if math.hypot(bot['x'] - target_x, bot['y'] - target_y) < 32:
-                deal_damage_bot(bot, 30, p)
-                game_state['events'].append({'type': 'punch', 'x': target_x, 'y': target_y})
+                deal_damage_bot(bot, int(30 * dmg_mult), p)
+                game_state['events'].append({'type': 'punch_blood', 'x': target_x, 'y': target_y})
                 return
 
         # Удар по гравцях
         for pid, other in game_state['players'].items():
             if other['id'] != p['id'] and other['isAlive'] and (not p['clan'] or other['clan'] != p['clan']):
                 if math.hypot(other['x'] - target_x, other['y'] - target_y) < 32:
-                    deal_damage(other, 25, p)
-                    game_state['events'].append({'type': 'punch', 'x': target_x, 'y': target_y})
+                    deal_damage(other, int(25 * dmg_mult), p)
+                    game_state['events'].append({'type': 'punch_blood', 'x': target_x, 'y': target_y})
                     return
 
-    elif w == 'nuke_remote':
+    elif itype == 'wall':
+        if item.get('count', 0) > 0 or (p['wood'] >= 20 and p['stone'] >= 10):
+            if item.get('count', 0) > 0: item['count'] -= 1
+            else: p['wood'] -= 20; p['stone'] -= 10
+            p['shootCd'] = 18
+            wall_x = p['x'] + math.cos(p['angle']) * 55
+            wall_y = p['y'] + math.sin(p['angle']) * 55
+            game_state['placed_walls'].append({
+                'id': random.random(),
+                'x': wall_x, 'y': wall_y,
+                'hp': 300, 'maxHp': 300,
+                'ownerClan': p['clan']
+            })
+            add_xp(p, 12)
+            game_state['events'].append({'type': 'build_dust', 'x': wall_x, 'y': wall_y})
+
+    elif itype == 'medkit':
+        if item.get('count', 0) > 0 and p['hp'] < p['maxHp']:
+            item['count'] -= 1
+            p['shootCd'] = 25
+            p['hp'] = min(p['maxHp'], p['hp'] + 50)
+            game_state['events'].append({'type': 'heal_particles', 'x': p['x'], 'y': p['y']})
+
+    elif itype == 'nuke_remote':
         p['shootCd'] = 60
-        p['weapon'] = 'stick'
+        item['type'] = 'empty'
+        item['name'] = 'Порожньо'
+        item['icon'] = '▫️'
         is_life = random.random() < 0.5
         if is_life:
             for pl in game_state['players'].values():
                 if math.hypot(pl['x'] - p['x'], pl['y'] - p['y']) < 600:
                     pl['hp'] = pl['maxHp']
-            game_state['events'].append({'type': 'floatText', 'x': p['x'], 'y': p['y'] - 40, 'text': '💚 ПУЛЬТ ЖИТТЯ: ВСІ ЗЦІЛЕНІ!', 'color': '#00ff88'})
             game_state['events'].append({'type': 'heal_wave', 'x': p['x'], 'y': p['y']})
+            game_state['events'].append({'type': 'floatText', 'x': p['x'], 'y': p['y'] - 40, 'text': '💚 ПУЛЬТ ЖИТТЯ!', 'color': '#00ff88'})
         else:
             p['hp'] = 0
             p['isAlive'] = False
-            game_state['events'].append({'type': 'nuke_explode', 'x': p['x'], 'y': p['y']})
-            game_state['events'].append({'type': 'floatText', 'x': p['x'], 'y': p['y'] - 40, 'text': '☢️ ЯДЕРНИЙ ВИБУХ!', 'color': '#ff2255'})
+            game_state['events'].append({'type': 'massive_nuke', 'x': p['x'], 'y': p['y']})
             for pl in game_state['players'].values():
-                if pl['id'] != p['id'] and pl['isAlive'] and math.hypot(pl['x'] - p['x'], pl['y'] - p['y']) < 350:
-                    deal_damage(pl, 90, p)
-    else:
+                if pl['id'] != p['id'] and pl['isAlive'] and math.hypot(pl['x'] - p['x'], pl['y'] - p['y']) < 400:
+                    deal_damage(pl, 100, p)
+
+    elif itype != 'empty':
         if p['ammo'] <= 0:
             await reload(p['id'])
             return
 
         p['ammo'] -= 1
         bullet_cfg = {
-            'rifle': {'dmg': 26, 'speed': 15, 'color': '#ffcc00', 'cd': 12, 'type': 'bullet'},
-            'minigun': {'dmg': 17, 'speed': 17, 'color': '#ff5500', 'cd': 5, 'type': 'bullet'},
-            'banana': {'dmg': 35, 'speed': 11, 'color': '#ffe600', 'cd': 18, 'type': 'banana'},
-            'boomerang': {'dmg': 40, 'speed': 12, 'color': '#a35d27', 'cd': 22, 'type': 'boomerang'},
-            'eye_laser': {'dmg': 20, 'speed': 24, 'color': '#ff0055', 'cd': 4, 'type': 'laser'},
-            'water_pistol': {'dmg': 14, 'speed': 13, 'color': '#00d0ff', 'cd': 7, 'type': 'water'}
-        }.get(w, {'dmg': 20, 'speed': 14, 'color': '#fff', 'cd': 10, 'type': 'bullet'})
+            'rifle': {'dmg': int(26 * dmg_mult), 'speed': 16, 'color': '#ffcc00', 'cd': 10, 'type': 'bullet'},
+            'minigun': {'dmg': int(18 * dmg_mult), 'speed': 18, 'color': '#ff5500', 'cd': 5, 'type': 'bullet'},
+            'banana': {'dmg': int(38 * dmg_mult), 'speed': 12, 'color': '#ffe600', 'cd': 16, 'type': 'banana'},
+            'boomerang': {'dmg': int(42 * dmg_mult), 'speed': 13, 'color': '#a35d27', 'cd': 20, 'type': 'boomerang'},
+            'eye_laser': {'dmg': int(22 * dmg_mult), 'speed': 25, 'color': '#ff0055', 'cd': 4, 'type': 'laser'},
+            'water_pistol': {'dmg': int(16 * dmg_mult), 'speed': 14, 'color': '#00d0ff', 'cd': 6, 'type': 'water'}
+        }.get(itype, {'dmg': 20, 'speed': 14, 'color': '#fff', 'cd': 10, 'type': 'bullet'})
 
         p['shootCd'] = bullet_cfg['cd']
         game_state['bullets'].append({
@@ -244,102 +330,147 @@ async def handle_shooting(p):
             'bType': bullet_cfg['type'],
             'life': 70
         })
-        game_state['events'].append({'type': 'shoot', 'weapon': w})
+        game_state['events'].append({'type': 'shoot_muzzle', 'x': p['x'] + math.cos(p['angle'])*20, 'y': p['y'] + math.sin(p['angle'])*20, 'weapon': itype})
 
 def deal_damage(target, dmg, attacker=None):
     actual_dmg = max(5, dmg - target.get('armor', 0))
     target['hp'] -= actual_dmg
-    game_state['events'].append({'type': 'damage', 'x': target['x'], 'y': target['y'], 'val': actual_dmg})
+    game_state['events'].append({'type': 'damage_blood', 'x': target['x'], 'y': target['y'], 'val': actual_dmg})
     if target['hp'] <= 0:
         target['isAlive'] = False
         target['hp'] = 0
+        if attacker:
+            add_xp(attacker, 75)
+            attacker['scrap'] += 30
         game_state['events'].append({'type': 'floatText', 'x': target['x'], 'y': target['y'] - 30, 'text': '☠️ ЗАГИБЕЛЬ', 'color': '#ff2255'})
 
 def deal_damage_bot(bot, dmg, attacker=None):
     bot['hp'] -= dmg
-    game_state['events'].append({'type': 'damage', 'x': bot['x'], 'y': bot['y'], 'val': dmg})
+    game_state['events'].append({'type': 'damage_blood', 'x': bot['x'], 'y': bot['y'], 'val': dmg})
     if bot['hp'] <= 0:
         if attacker:
+            add_xp(attacker, 45)
             attacker['scrap'] += 20
-            attacker['ammo'] += 15
-            game_state['events'].append({'type': 'floatText', 'x': bot['x'], 'y': bot['y'] - 20, 'text': '+20 ⚙️ +15 📦', 'color': '#00ff88'})
-        # Респавн бота в іншому місці
+            attacker['ammo'] += 20
+            game_state['events'].append({'type': 'floatText', 'x': bot['x'], 'y': bot['y'] - 20, 'text': '+45 XP +20⚙️', 'color': '#00ff88'})
         bot['x'] = random.randint(300, MAP_SIZE - 300)
         bot['y'] = random.randint(300, MAP_SIZE - 300)
         bot['hp'] = bot['maxHp']
         bot['state'] = 'patrol'
 
-@sio.event
-async def buildWall(sid):
-    p = game_state['players'].get(sid)
-    if not p or not p['isAlive']:
-        return
-
-    if p['wallKits'] > 0 or (p['wood'] >= 20 and p['stone'] >= 10):
-        if p['wallKits'] > 0:
-            p['wallKits'] -= 1
-        else:
-            p['wood'] -= 20
-            p['stone'] -= 10
-
-        wall_x = p['x'] + math.cos(p['angle']) * 55
-        wall_y = p['y'] + math.sin(p['angle']) * 55
-
-        game_state['placed_walls'].append({
-            'id': random.random(),
-            'x': wall_x,
-            'y': wall_y,
-            'hp': 300,
-            'maxHp': 300,
-            'ownerClan': p['clan']
-        })
-        game_state['events'].append({'type': 'floatText', 'x': wall_x, 'y': wall_y, 'text': '🧱 СТІНА', 'color': '#00f0ff'})
+# --- КЛАНИ ТА ЧАТ ---
 
 @sio.event
-async def craftItem(sid, item_type):
+async def createClan(sid, data):
     p = game_state['players'].get(sid)
-    if not p or not p['isAlive']:
+    if not p: return
+    name = (data.get('name') or 'Клан')[:16].strip()
+    tag = (data.get('tag') or 'CLAN').upper()[:6].strip()
+    desc = (data.get('desc') or '')[:50].strip()
+
+    if tag in clans:
+        await sio.emit('chatMessage', {'sender': 'СИСТЕМА', 'text': f'Тег [{tag}] вже зайнято!', 'color': '#ff2255'}, room=sid)
         return
 
-    if item_type == 'wall' and p['wood'] >= 25 and p['stone'] >= 15:
-        p['wood'] -= 25; p['stone'] -= 15; p['wallKits'] += 1
-    elif item_type == 'medkit' and p['wood'] >= 10 and p['scrap'] >= 10:
-        p['wood'] -= 10; p['scrap'] -= 10; p['medkits'] += 1
-    elif item_type == 'armor' and p['stone'] >= 40 and p['scrap'] >= 25:
-        p['stone'] -= 40; p['scrap'] -= 25; p['armor'] = min(60, p['armor'] + 20)
-    elif item_type == 'ammo' and p['stone'] >= 15 and p['scrap'] >= 15:
-        p['stone'] -= 15; p['scrap'] -= 15; p['ammo'] += 30
+    clans[tag] = {'tag': tag, 'name': name, 'leader': p['name'], 'desc': desc, 'members': [p['name']]}
+    p['clan'] = tag
+    await sio.emit('clanUpdated', clans)
+    await sio.emit('chatMessage', {'sender': 'СИСТЕМА', 'text': f'Клан [{tag}] "{name}" успішно створено!', 'color': '#00ff88'})
+
+@sio.event
+async def joinClan(sid, tag):
+    p = game_state['players'].get(sid)
+    if not p or tag not in clans: return
+    p['clan'] = tag
+    if p['name'] not in clans[tag]['members']:
+        clans[tag]['members'].append(p['name'])
+    await sio.emit('clanUpdated', clans)
+    await sio.emit('chatMessage', {'sender': 'СИСТЕМА', 'text': f'Ви вступили в клан [{tag}]!', 'color': '#00ff88'}, room=sid)
+
+@sio.event
+async def sendChat(sid, data):
+    p = game_state['players'].get(sid)
+    if not p: return
+    msg = (data.get('message') or '')[:80].strip()
+    channel = data.get('channel', 'all')  # 'all' | 'clan'
+
+    if not msg: return
+
+    # Команди
+    if msg.startswith('/'):
+        parts = msg.split()
+        cmd = parts[0].lower()
+        if cmd == '/help':
+            await sio.emit('chatMessage', {'sender': 'КОМАНДИ', 'text': '/help, /clan <tag>, /stats, /clear', 'color': '#38bdf8'}, room=sid)
+        elif cmd == '/stats':
+            txt = f"Рівень: {p['level']} | HP: {p['hp']}/{p['maxHp']} | Вбивств/Скрап: {p['scrap']}"
+            await sio.emit('chatMessage', {'sender': 'СТАТИСТИКА', 'text': txt, 'color': '#38bdf8'}, room=sid)
+        return
+
+    p['chatMsg'] = msg
+    p['chatTimer'] = 120  # 4 секунди бабл над головою
+
+    payload = {
+        'sender': p['name'],
+        'clan': p['clan'],
+        'text': msg,
+        'channel': channel,
+        'color': '#38bdf8' if channel == 'clan' else '#e2e8f0'
+    }
+
+    if channel == 'clan' and p['clan']:
+        for pl_id, pl in game_state['players'].items():
+            if pl['clan'] == p['clan']:
+                await sio.emit('chatMessage', payload, room=pl_id)
+    else:
+        await sio.emit('chatMessage', payload)
 
 @sio.event
 async def interactChest(sid):
     p = game_state['players'].get(sid)
-    if not p or not p['isAlive']:
-        return
+    if not p or not p['isAlive']: return
 
     for chest in game_state['chests']:
         if not chest['opened'] and math.hypot(chest['x'] - p['x'], chest['y'] - p['y']) < 65:
             chest['opened'] = True
             chest['respawnTimer'] = 180
+            p['ammo'] += 30
+            p['wood'] += 30
+            p['scrap'] += 25
+            add_xp(p, 35)
 
-            p['ammo'] += 25
-            p['medkits'] += 1
-            p['wood'] += 25
-            p['scrap'] += 20
-
-            if random.random() < 0.7:
-                p['weapon'] = random.choice(SPECIAL_WEAPONS)
-                game_state['events'].append({'type': 'floatText', 'x': p['x'], 'y': p['y'] - 35, 'text': f"🎁 ЗБРОЯ: {p['weapon'].upper()}!", 'color': '#ffe600'})
-            else:
-                game_state['events'].append({'type': 'floatText', 'x': p['x'], 'y': p['y'] - 35, 'text': '📦 ЛУТ ЗІБРАНО!', 'color': '#00ff88'})
+            # Додаємо спец-предмет у вільний або 3-й слот хотбара
+            new_wpn = random.choice(SPECIAL_WEAPONS)
+            p['hotbar'][2] = {'slot': 2, 'type': new_wpn, 'name': new_wpn.upper(), 'icon': '🎁'}
+            game_state['events'].append({'type': 'chest_loot_sparks', 'x': chest['x'], 'y': chest['y']})
+            game_state['events'].append({'type': 'floatText', 'x': p['x'], 'y': p['y'] - 35, 'text': f"🎁 {new_wpn.upper()} В СЛОТІ 3!", 'color': '#ffe600'})
             return
 
 @sio.event
-async def useMedkit(sid):
+async def craftItem(sid, item_type):
     p = game_state['players'].get(sid)
-    if p and p['isAlive'] and p['medkits'] > 0:
-        p['medkits'] -= 1
-        p['hp'] = min(p['maxHp'], p['hp'] + 45)
-        game_state['events'].append({'type': 'floatText', 'x': p['x'], 'y': p['y'] - 30, 'text': '+45 HP 💉', 'color': '#00ff88'})
+    if not p or not p['isAlive']: return
+
+    if item_type == 'wall' and p['wood'] >= 25 and p['stone'] >= 15:
+        p['wood'] -= 25; p['stone'] -= 15
+        p['hotbar'][3]['count'] = p['hotbar'][3].get('count', 0) + 3
+        add_xp(p, 15)
+        game_state['events'].append({'type': 'floatText', 'x': p['x'], 'y': p['y'] - 30, 'text': '+3 Стіни 🧱', 'color': '#00ff88'})
+    elif item_type == 'medkit' and p['wood'] >= 10 and p['scrap'] >= 10:
+        p['wood'] -= 10; p['scrap'] -= 10
+        p['hotbar'][4]['count'] = p['hotbar'][4].get('count', 0) + 1
+        add_xp(p, 15)
+        game_state['events'].append({'type': 'floatText', 'x': p['x'], 'y': p['y'] - 30, 'text': '+1 Аптечка 💉', 'color': '#00ff88'})
+    elif item_type == 'armor' and p['stone'] >= 40 and p['scrap'] >= 25:
+        p['stone'] -= 40; p['scrap'] -= 25
+        p['armor'] = min(60, p['armor'] + 20)
+        add_xp(p, 25)
+        game_state['events'].append({'type': 'floatText', 'x': p['x'], 'y': p['y'] - 30, 'text': '🛡️ БРОНЯ +20', 'color': '#38bdf8'})
+    elif item_type == 'ammo' and p['stone'] >= 15 and p['scrap'] >= 15:
+        p['stone'] -= 15; p['scrap'] -= 15
+        p['ammo'] += 40
+        add_xp(p, 10)
+        game_state['events'].append({'type': 'floatText', 'x': p['x'], 'y': p['y'] - 30, 'text': '+40 Набоїв 📦', 'color': '#ffe600'})
 
 @sio.event
 async def reload(sid):
@@ -356,7 +487,7 @@ async def respawn(sid):
         p['x'] = random.randint(1000, MAP_SIZE - 1000)
         p['y'] = random.randint(1000, MAP_SIZE - 1000)
         p['isAlive'] = True
-        p['weapon'] = 'stick'
+        p['activeSlot'] = 0
         p['ammo'] = 30
 
 @sio.event
@@ -364,20 +495,18 @@ async def disconnect(sid):
     if sid in game_state['players']:
         del game_state['players'][sid]
 
-# --- ШТУЧНИЙ ІНТЕЛЕКТ БОТІВ ТА ІГРОВИЙ ЦИКЛ (30 FPS) ---
+# --- ІГРОВИЙ ЦИКЛ (30 FPS) ---
 async def game_loop():
     while True:
         active_players = [p for p in game_state['players'].values() if p['isAlive']]
 
-        # Оновлення ботів (Розумний ШІ з маневруванням і відступом)
+        # ШІ ботів
         for bot in game_state['bots']:
-            # Зміна напрямку стрейфу
             bot['strafeTimer'] -= 1
             if bot['strafeTimer'] <= 0:
                 bot['strafeDir'] *= -1
                 bot['strafeTimer'] = random.randint(25, 60)
 
-            # Пошук найближчого живого гравця
             target = None
             min_dist = 600
             for pl in active_players:
@@ -391,19 +520,15 @@ async def game_loop():
                 to_target_a = math.atan2(target['y'] - bot['y'], target['x'] - bot['x'])
                 bot['angle'] = to_target_a
 
-                # Тактична логіка
                 if bot['hp'] < bot['maxHp'] * 0.3:
-                    # Відступ / Тікає, якщо мало здоров'я
                     bot['x'] -= math.cos(to_target_a) * 2.8
                     bot['y'] -= math.sin(to_target_a) * 2.8
                 elif bot['type'] == 'berserk':
-                    # Берсерк біжить прямо на гравця
                     bot['x'] += math.cos(to_target_a) * 3.6
                     bot['y'] += math.sin(to_target_a) * 3.6
                     if min_dist < 45:
                         deal_damage(target, 18)
                 else:
-                    # Стрільці тримають дистанцію (200-300px) і стрейфлять навколо
                     strafe_a = to_target_a + (math.pi / 2) * bot['strafeDir']
                     if min_dist > 280:
                         bot['x'] += math.cos(to_target_a) * 2.0
@@ -411,11 +536,9 @@ async def game_loop():
                     elif min_dist < 150:
                         bot['x'] -= math.cos(to_target_a) * 2.0
                         bot['y'] -= math.sin(to_target_a) * 2.0
-                    
                     bot['x'] += math.cos(strafe_a) * 1.8
                     bot['y'] += math.sin(strafe_a) * 1.8
 
-                    # Стрільба бота
                     bot['cd'] -= 1
                     if bot['cd'] <= 0:
                         game_state['bullets'].append({
@@ -431,7 +554,6 @@ async def game_loop():
                         })
                         bot['cd'] = 22 if bot['type'] == 'cyborg' else 40
             else:
-                # Патрулювання
                 bot['state'] = 'patrol'
                 bot['x'] += math.cos(bot['patrolAngle']) * 1.2
                 bot['y'] += math.sin(bot['patrolAngle']) * 1.2
@@ -442,7 +564,7 @@ async def game_loop():
             bot['x'] = max(50, min(MAP_SIZE - 50, bot['x']))
             bot['y'] = max(50, min(MAP_SIZE - 50, bot['y']))
 
-        # Оновлення куль
+        # Кулі
         for i in range(len(game_state['bullets']) - 1, -1, -1):
             b = game_state['bullets'][i]
             b['x'] += b['vx']
@@ -454,11 +576,11 @@ async def game_loop():
             for w in game_state['placed_walls']:
                 if math.hypot(w['x'] - b['x'], w['y'] - b['y']) < 28:
                     w['hp'] -= b['dmg']
+                    game_state['events'].append({'type': 'wall_hit_debris', 'x': b['x'], 'y': b['y']})
                     game_state['bullets'].pop(i)
                     hit_wall = True
                     break
-            if hit_wall:
-                continue
+            if hit_wall: continue
 
             # Влучання у ботів
             if not b['ownerId'].startswith('bot_'):
@@ -470,8 +592,7 @@ async def game_loop():
                         game_state['bullets'].pop(i)
                         hit_bot = True
                         break
-                if hit_bot:
-                    continue
+                if hit_bot: continue
 
             # Влучання у гравців
             hit_player = False
@@ -484,8 +605,7 @@ async def game_loop():
                         game_state['bullets'].pop(i)
                         hit_player = True
                         break
-            if hit_player:
-                continue
+            if hit_player: continue
 
             if b['life'] <= 0 and i < len(game_state['bullets']):
                 game_state['bullets'].pop(i)
