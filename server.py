@@ -5,17 +5,23 @@ import asyncio
 import socketio
 from aiohttp import web
 
-# Ініціалізація Socket.IO сервера
-sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
+# Налаштування Socket.IO сервера для стабільного з'єднання на Render
+sio = socketio.AsyncServer(
+    async_mode='aiohttp',
+    cors_allowed_origins='*',
+    ping_timeout=60,
+    ping_interval=25
+)
 app = web.Application()
 sio.attach(app)
 
 PORT = int(os.environ.get('PORT', 3000))
+SERVER_URL = "https://em-server-e9ib.onrender.com"
 MAP_SIZE = 3000
 BASE_CENTER = {'x': 1500, 'y': 1500}
 EVAC_ZONE = {'x': 300, 'y': 300, 'r': 180}
 
-# Стан гри
+# Спільний стан гри
 game_state = {
     'phase': 1,  # 1 = Штурм, 2 = Евакуація, 3 = Перемога
     'evacTimer': 45,
@@ -58,11 +64,11 @@ def init_enemies():
 
 init_enemies()
 
-# --- ОБРОБКА ПІДКЛЮЧЕНЬ SOCKET.IO ---
+# --- ОБРОБКА ПІДКЛЮЧЕНЬ ТА СИНХРОНІЗАЦІЯ ---
 
 @sio.event
 async def connect(sid, environ):
-    print(f"[CONNECT] Гравець підключився: {sid}")
+    print(f"[{sid}] Гравець успішно підключився до {SERVER_URL}")
     game_state['players'][sid] = {
         'id': sid,
         'name': "Боєць",
@@ -104,7 +110,7 @@ async def playerInput(sid, data):
     p['x'] = max(50, min(MAP_SIZE - 50, p['x']))
     p['y'] = max(50, min(MAP_SIZE - 50, p['y']))
 
-    # Стрільба
+    # Обробка пострілів
     if data.get('isShooting') and p['shootCd'] <= 0:
         if p['ammo'] > 0:
             p['ammo'] -= 1
@@ -151,11 +157,10 @@ async def buyArmory(sid, item_type):
 
 @sio.event
 async def disconnect(sid):
-    print(f"[DISCONNECT] Гравець вийшов: {sid}")
+    print(f"[{sid}] Гравець вийшов з гри")
     if sid in game_state['players']:
         del game_state['players'][sid]
 
-# --- ФОНОВИЙ ТАЙМЕР ЕВАКУАЦІЇ ---
 async def evac_countdown():
     while game_state['evacTimer'] > 0:
         await asyncio.sleep(1)
@@ -166,7 +171,6 @@ def check_base_condition():
     if destroyed == len(game_state['structures']) and game_state['teamFuel'] >= 80 and game_state['phase'] == 1:
         game_state['phase'] = 2
         asyncio.create_task(evac_countdown())
-        # Хвиля ворогів
         for _ in range(20):
             game_state['enemies'].append({
                 'id': random.random(),
@@ -175,10 +179,10 @@ def check_base_condition():
                 'hp': 50, 'type': 'soldier', 'cd': 0, 'r': 15, 'angle': 0
             })
 
-# --- ГОЛОВНИЙ ІГРОВИЙ ЦИКЛ (30 FPS) ---
+# --- ІГРОВИЙ ЦИКЛ СЕРВЕРА (30 FPS) ---
 async def game_loop():
     while True:
-        # 1. Оновлення куль
+        # 1. Кулі та влучання
         for i in range(len(game_state['bullets']) - 1, -1, -1):
             b = game_state['bullets'][i]
             b['x'] += b['vx']
@@ -186,7 +190,6 @@ async def game_loop():
             b['life'] -= 1
 
             if b['isEnemy']:
-                # Влучання у гравця
                 hit = False
                 for pid, pl in game_state['players'].items():
                     if pl['isAlive'] and math.hypot(pl['x'] - b['x'], pl['y'] - b['y']) < 18:
@@ -199,7 +202,6 @@ async def game_loop():
                 if hit:
                     continue
             else:
-                # Влучання у ворога
                 hit_enemy = False
                 for j in range(len(game_state['enemies']) - 1, -1, -1):
                     e = game_state['enemies'][j]
@@ -222,7 +224,6 @@ async def game_loop():
                 if hit_enemy:
                     continue
 
-                # Влучання у будівлі
                 hit_struct = False
                 for s in game_state['structures']:
                     if s['hp'] > 0 and (s['x'] - s['w']/2 < b['x'] < s['x'] + s['w']/2) and (s['y'] - s['h']/2 < b['y'] < s['y'] + s['h']/2):
@@ -242,13 +243,12 @@ async def game_loop():
             if b['life'] <= 0 and i < len(game_state['bullets']):
                 game_state['bullets'].pop(i)
 
-        # 2. Штучний інтелект ворогів
+        # 2. ШІ ворогів
         active_players = [p for p in game_state['players'].values() if p['isAlive']]
         for e in game_state['enemies']:
             if not active_players:
                 break
             
-            # Пошук найближчого бійця
             target = min(active_players, key=lambda p: math.hypot(p['x'] - e['x'], p['y'] - e['y']))
             dist = math.hypot(target['x'] - e['x'], target['y'] - e['y'])
 
@@ -271,7 +271,7 @@ async def game_loop():
                     })
                     e['cd'] = 35 if e['type'] == 'turret' else 45
 
-        # 3. Підбір предметів
+        # 3. Підбір палива та аптечок
         for i in range(len(game_state['pickups']) - 1, -1, -1):
             pick = game_state['pickups'][i]
             for pl in game_state['players'].values():
@@ -286,17 +286,16 @@ async def game_loop():
                     check_base_condition()
                     break
 
-        # 4. Перевірка перемоги
+        # 4. Перевірка евакуації
         if game_state['phase'] == 2 and game_state['evacTimer'] <= 0:
             in_zone = [p for p in active_players if math.hypot(p['x'] - EVAC_ZONE['x'], p['y'] - EVAC_ZONE['y']) < EVAC_ZONE['r']]
             if in_zone and len(in_zone) == len(active_players):
                 game_state['phase'] = 3
 
-        # Відправка стану гри всім клієнтам
+        # Синхронізація з усіма клієнтами через Socket.IO
         await sio.emit('stateUpdate', game_state)
         await asyncio.sleep(1 / 30)
 
-# Роздача статичних файлів HTML
 async def index_handler(request):
     return web.FileResponse(os.path.join(os.path.dirname(__file__), 'public', 'index.html'))
 
@@ -313,5 +312,5 @@ app.on_startup.append(start_background_tasks)
 app.on_cleanup.append(cleanup_background_tasks)
 
 if __name__ == '__main__':
-    print(f"[PYTHON SERVER] Сервер запускається на порту {PORT}...")
+    print(f"[СЕРВЕР ЗАПУЩЕНО]: Порт {PORT} | Адреса: {SERVER_URL}")
     web.run_app(app, port=PORT)
