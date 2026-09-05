@@ -1,266 +1,317 @@
-import asyncio
-import websockets
-import json
-import hashlib
 import os
-import random
 import math
-import time
+import random
+import asyncio
+import socketio
+from aiohttp import web
 
-PORT = int(os.environ.get('PORT', 10000))
-DB_FILE = 'database.json'
-ISLAND_RADIUS = 75.0
+# Ініціалізація Socket.IO сервера
+sio = socketio.AsyncServer(async_mode='aiohttp', cors_allowed_origins='*')
+app = web.Application()
+sio.attach(app)
 
-# Константи безпеки (Anti-Cheat Thresholds)
-MAX_RUN_SPEED = 12.0       # Максимальна швидкість м/с (спринт + запас на пінг)
-MAX_REACH_DIST = 5.5       # Максимальна дистанція збору/будівництва
-MIN_HARVEST_INTERVAL = 0.22 # Cooldown між ударами (сек)
-MIN_BUILD_INTERVAL = 0.3    # Cooldown між будівництвом (сек)
+PORT = int(os.environ.get('PORT', 3000))
+MAP_SIZE = 3000
+BASE_CENTER = {'x': 1500, 'y': 1500}
+EVAC_ZONE = {'x': 300, 'y': 300, 'r': 180}
 
-def load_db():
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, 'r') as f:
-            return json.load(f)
-    return {"users": {}, "bans": []}
-
-def save_db(db):
-    with open(DB_FILE, 'w') as f:
-        json.dump(db, f, indent=2)
-
-def hash_pwd(pwd):
-    return hashlib.sha256(pwd.encode('utf-8')).hexdigest()
-
-db = load_db()
-
-CRAFTING_RECIPES = {
-    "wood_spear": {"cost": {"wood": 300}},
-    "stone_hatchet": {"cost": {"wood": 200, "stone": 100}},
-    "stone_pickaxe": {"cost": {"wood": 200, "stone": 100}},
-    "building_plan": {"cost": {"wood": 20}},
-    "wood_wall": {"cost": {"wood": 100}},
-    "wood_foundation": {"cost": {"wood": 150}}
+# Стан гри
+game_state = {
+    'phase': 1,  # 1 = Штурм, 2 = Евакуація, 3 = Перемога
+    'evacTimer': 45,
+    'teamFuel': 0,
+    'maxFuel': 100,
+    'players': {},
+    'bullets': [],
+    'enemies': [],
+    'pickups': [],
+    'structures': [
+        {'id': 1, 'name': "Головний Реактор", 'x': 1500, 'y': 1500, 'w': 120, 'h': 120, 'hp': 600, 'maxHp': 600, 'icon': "💥", 'color': "#ff2255"},
+        {'id': 2, 'name': "Радарний Комплекс", 'x': 1250, 'y': 1350, 'w': 90, 'h': 90, 'hp': 350, 'maxHp': 350, 'icon': "📡", 'color': "#00f0ff"},
+        {'id': 3, 'name': "Казарми Кіборгів", 'x': 1750, 'y': 1350, 'w': 100, 'h': 100, 'hp': 400, 'maxHp': 400, 'icon': "🏢", 'color': "#b026ff"},
+        {'id': 4, 'name': "Склад Бензину", 'x': 1500, 'y': 1750, 'w': 100, 'h': 100, 'hp': 350, 'maxHp': 350, 'icon': "⛽", 'color': "#ffaa00"}
+    ]
 }
 
-# Генерація ресурсів
-nodes = {}
-for i in range(50):
-    ang = random.uniform(0, math.pi * 2)
-    dst = random.uniform(5, ISLAND_RADIUS - 10)
-    nodes[i] = {"id": i, "type": "tree", "x": math.cos(ang)*dst, "z": math.sin(ang)*dst, "hp": 5}
-for i in range(50, 85):
-    ang = random.uniform(0, math.pi * 2)
-    dst = random.uniform(5, ISLAND_RADIUS - 8)
-    nodes[i] = {"id": i, "type": "rock", "x": math.cos(ang)*dst, "z": math.sin(ang)*dst, "hp": 7}
+def init_enemies():
+    game_state['enemies'] = []
+    turrets = [
+        {'x': 1350, 'y': 1350}, {'x': 1650, 'y': 1350},
+        {'x': 1350, 'y': 1650}, {'x': 1650, 'y': 1650}
+    ]
+    for t in turrets:
+        game_state['enemies'].append({
+            'id': random.random(),
+            'x': t['x'], 'y': t['y'],
+            'hp': 150, 'type': 'turret',
+            'cd': 0, 'r': 22
+        })
 
-buildings = []
-building_counter = 0
-clients = {}
+    for _ in range(30):
+        game_state['enemies'].append({
+            'id': random.random(),
+            'x': BASE_CENTER['x'] + (random.random() - 0.5) * 800,
+            'y': BASE_CENTER['y'] + (random.random() - 0.5) * 800,
+            'hp': 45, 'type': 'soldier',
+            'cd': 0, 'r': 15, 'angle': 0
+        })
 
-async def broadcast():
+init_enemies()
+
+# --- ОБРОБКА ПІДКЛЮЧЕНЬ SOCKET.IO ---
+
+@sio.event
+async def connect(sid, environ):
+    print(f"[CONNECT] Гравець підключився: {sid}")
+    game_state['players'][sid] = {
+        'id': sid,
+        'name': "Боєць",
+        'x': EVAC_ZONE['x'] + (random.random() - 0.5) * 60,
+        'y': EVAC_ZONE['y'] + (random.random() - 0.5) * 60,
+        'vx': 0, 'vy': 0,
+        'angle': 0,
+        'hp': 100, 'maxHp': 100,
+        'credits': 50,
+        'ammo': 30, 'maxAmmo': 30,
+        'weapon': 'rifle',
+        'shootCd': 0,
+        'isAlive': True
+    }
+
+@sio.event
+async def setNickname(sid, name):
+    if sid in game_state['players']:
+        game_state['players'][sid]['name'] = (name or "Боєць")[:14]
+
+@sio.event
+async def playerInput(sid, data):
+    p = game_state['players'].get(sid)
+    if not p or not p['isAlive']:
+        return
+
+    p['angle'] = data.get('angle', 0)
+    keys = data.get('keys', {})
+    speed = 4.2
+    
+    vx = (1 if keys.get('d') else 0) - (1 if keys.get('a') else 0)
+    vy = (1 if keys.get('s') else 0) - (1 if keys.get('w') else 0)
+    
+    length = math.hypot(vx, vy)
+    if length > 0:
+        p['x'] += (vx / length) * speed
+        p['y'] += (vy / length) * speed
+
+    p['x'] = max(50, min(MAP_SIZE - 50, p['x']))
+    p['y'] = max(50, min(MAP_SIZE - 50, p['y']))
+
+    # Стрільба
+    if data.get('isShooting') and p['shootCd'] <= 0:
+        if p['ammo'] > 0:
+            p['ammo'] -= 1
+            game_state['bullets'].append({
+                'x': p['x'], 'y': p['y'],
+                'vx': math.cos(p['angle']) * 14,
+                'vy': math.sin(p['angle']) * 14,
+                'ownerId': p['id'],
+                'isEnemy': False,
+                'dmg': 18 if p['weapon'] == 'minigun' else 28,
+                'color': '#00f0ff',
+                'life': 80
+            })
+            p['shootCd'] = 6 if p['weapon'] == 'minigun' else 14
+            
+    if p['shootCd'] > 0:
+        p['shootCd'] -= 1
+
+@sio.event
+async def reload(sid):
+    p = game_state['players'].get(sid)
+    if p and p['isAlive']:
+        await asyncio.sleep(1.2)
+        p['ammo'] = p['maxAmmo']
+
+@sio.event
+async def buyArmory(sid, item_type):
+    p = game_state['players'].get(sid)
+    if not p or not p['isAlive']:
+        return
+
+    if item_type == 'armor' and p['credits'] >= 60:
+        p['credits'] -= 60
+        p['maxHp'] += 50
+        p['hp'] += 50
+    elif item_type == 'gun' and p['credits'] >= 120:
+        p['credits'] -= 120
+        p['weapon'] = 'minigun'
+        p['maxAmmo'] = 60
+        p['ammo'] = 60
+    elif item_type == 'heal' and p['credits'] >= 35:
+        p['credits'] -= 35
+        p['hp'] = p['maxHp']
+
+@sio.event
+async def disconnect(sid):
+    print(f"[DISCONNECT] Гравець вийшов: {sid}")
+    if sid in game_state['players']:
+        del game_state['players'][sid]
+
+# --- ФОНОВИЙ ТАЙМЕР ЕВАКУАЦІЇ ---
+async def evac_countdown():
+    while game_state['evacTimer'] > 0:
+        await asyncio.sleep(1)
+        game_state['evacTimer'] -= 1
+
+def check_base_condition():
+    destroyed = len([s for s in game_state['structures'] if s['hp'] <= 0])
+    if destroyed == len(game_state['structures']) and game_state['teamFuel'] >= 80 and game_state['phase'] == 1:
+        game_state['phase'] = 2
+        asyncio.create_task(evac_countdown())
+        # Хвиля ворогів
+        for _ in range(20):
+            game_state['enemies'].append({
+                'id': random.random(),
+                'x': EVAC_ZONE['x'] + (random.random() - 0.5) * 600,
+                'y': EVAC_ZONE['y'] + (random.random() - 0.5) * 600,
+                'hp': 50, 'type': 'soldier', 'cd': 0, 'r': 15, 'angle': 0
+            })
+
+# --- ГОЛОВНИЙ ІГРОВИЙ ЦИКЛ (30 FPS) ---
+async def game_loop():
     while True:
-        await asyncio.sleep(0.05)
-        if not clients:
-            continue
-        
-        plist = [{"username": d["username"], "x": d["x"], "y": d["y"], "z": d["z"], "yaw": d["yaw"]} for d in clients.values()]
-        
-        for ws, data in list(clients.items()):
-            data["hunger"] = max(0, data["hunger"] - 0.008)
-            data["thirst"] = max(0, data["thirst"] - 0.012)
-            if data["hunger"] == 0 or data["thirst"] == 0:
-                data["hp"] = max(0, data["hp"] - 0.04)
+        # 1. Оновлення куль
+        for i in range(len(game_state['bullets']) - 1, -1, -1):
+            b = game_state['bullets'][i]
+            b['x'] += b['vx']
+            b['y'] += b['vy']
+            b['life'] -= 1
 
-            packet = {
-                "type": "sync",
-                "players": plist,
-                "hp": data["hp"],
-                "hunger": data["hunger"],
-                "thirst": data["thirst"],
-                "inv": data["inv"],
-                "friends": data["friends"],
-                "nodes": nodes,
-                "buildings": buildings
-            }
-            try:
-                await ws.send(json.dumps(packet))
-            except Exception:
-                pass
+            if b['isEnemy']:
+                # Влучання у гравця
+                hit = False
+                for pid, pl in game_state['players'].items():
+                    if pl['isAlive'] and math.hypot(pl['x'] - b['x'], pl['y'] - b['y']) < 18:
+                        pl['hp'] -= b['dmg']
+                        if pl['hp'] <= 0:
+                            pl['isAlive'] = False
+                        game_state['bullets'].pop(i)
+                        hit = True
+                        break
+                if hit:
+                    continue
+            else:
+                # Влучання у ворога
+                hit_enemy = False
+                for j in range(len(game_state['enemies']) - 1, -1, -1):
+                    e = game_state['enemies'][j]
+                    if math.hypot(e['x'] - b['x'], e['y'] - b['y']) < e['r']:
+                        e['hp'] -= b['dmg']
+                        game_state['bullets'].pop(i)
+                        hit_enemy = True
+                        if e['hp'] <= 0:
+                            owner = game_state['players'].get(b['ownerId'])
+                            if owner:
+                                owner['credits'] += 15
+                            if random.random() < 0.65:
+                                game_state['pickups'].append({
+                                    'id': random.random(),
+                                    'x': e['x'], 'y': e['y'],
+                                    'type': 'fuel' if random.random() < 0.6 else 'medkit'
+                                })
+                            game_state['enemies'].pop(j)
+                        break
+                if hit_enemy:
+                    continue
 
-async def handler(websocket):
-    global building_counter
-    username = None
-    try:
-        async for message in websocket:
-            req = json.loads(message)
-            action = req.get("action")
-            now = time.time()
+                # Влучання у будівлі
+                hit_struct = False
+                for s in game_state['structures']:
+                    if s['hp'] > 0 and (s['x'] - s['w']/2 < b['x'] < s['x'] + s['w']/2) and (s['y'] - s['h']/2 < b['y'] < s['y'] + s['h']/2):
+                        s['hp'] -= b['dmg']
+                        game_state['bullets'].pop(i)
+                        hit_struct = True
+                        if s['hp'] <= 0:
+                            owner = game_state['players'].get(b['ownerId'])
+                            if owner:
+                                owner['credits'] += 80
+                            game_state['pickups'].append({'id': random.random(), 'x': s['x'], 'y': s['y'], 'type': 'fuel_big'})
+                            check_base_condition()
+                        break
+                if hit_struct:
+                    continue
 
-            # Реєстрація
-            if action == "register":
-                u = req.get("username", "").strip()
-                p = req.get("password", "")
-                if u in db["users"]:
-                    await websocket.send(json.dumps({"status": "error", "msg": "Нік зайнятий!"}))
-                elif len(u) < 3 or len(p) < 4:
-                    await websocket.send(json.dumps({"status": "error", "msg": "Короткий логін/пароль"}))
-                else:
-                    db["users"][u] = {"pwd": hash_pwd(p), "inv": {"wood": 100, "stone": 50, "cloth": 30}, "friends": []}
-                    save_db(db)
-                    await websocket.send(json.dumps({"status": "ok", "msg": "Успішна реєстрація!"}))
+            if b['life'] <= 0 and i < len(game_state['bullets']):
+                game_state['bullets'].pop(i)
 
-            # Вхід
-            elif action == "login":
-                u = req.get("username", "").strip()
-                p = req.get("password", "")
-                if u in db.get("bans", []):
-                    await websocket.send(json.dumps({"status": "error", "msg": "🚫 ВАШ АККАУНТ ЗАБАНЕНО АНТИЧІТОМ!"}))
-                    await websocket.close()
-                    return
+        # 2. Штучний інтелект ворогів
+        active_players = [p for p in game_state['players'].values() if p['isAlive']]
+        for e in game_state['enemies']:
+            if not active_players:
+                break
+            
+            # Пошук найближчого бійця
+            target = min(active_players, key=lambda p: math.hypot(p['x'] - e['x'], p['y'] - e['y']))
+            dist = math.hypot(target['x'] - e['x'], target['y'] - e['y'])
 
-                if u in db["users"] and db["users"][u]["pwd"] == hash_pwd(p):
-                    username = u
-                    udata = db["users"][u]
-                    clients[websocket] = {
-                        "username": username,
-                        "x": random.uniform(-10, 10), "y": 1.7, "z": random.uniform(-10, 10),
-                        "yaw": 0, "pitch": 0,
-                        "hp": 100, "hunger": 100, "thirst": 100,
-                        "inv": udata.get("inv", {"wood": 50, "stone": 0}),
-                        "friends": udata.get("friends", []),
-                        # Параметри безпеки для кожного гравця
-                        "last_move_time": now,
-                        "last_harvest_time": 0.0,
-                        "last_build_time": 0.0,
-                        "violation_flags": 0
-                    }
-                    await websocket.send(json.dumps({"status": "ok", "msg": "Вхід успішний!"}))
-                else:
-                    await websocket.send(json.dumps({"status": "error", "msg": "Невірні дані!"}))
+            if dist < 600:
+                e['angle'] = math.atan2(target['y'] - e['y'], target['x'] - e['x'])
+                if e['type'] == 'soldier':
+                    e['x'] += math.cos(e['angle']) * 2
+                    e['y'] += math.sin(e['angle']) * 2
+                
+                e['cd'] -= 1
+                if e['cd'] <= 0:
+                    game_state['bullets'].append({
+                        'x': e['x'], 'y': e['y'],
+                        'vx': math.cos(e['angle']) * 7.5,
+                        'vy': math.sin(e['angle']) * 7.5,
+                        'isEnemy': True,
+                        'dmg': 14 if e['type'] == 'turret' else 10,
+                        'color': '#ff3366',
+                        'life': 80
+                    })
+                    e['cd'] = 35 if e['type'] == 'turret' else 45
 
-            # Повідомлення від клієнтського античіта
-            elif action == "ac_report":
-                detected_process = req.get("detected")
-                print(f"[🚨 АНТИЧІТ БАН] Гравець '{username}' заблокований! Виявлено: {detected_process}")
-                if username:
-                    if "bans" not in db:
-                        db["bans"] = []
-                    if username not in db["bans"]:
-                        db["bans"].append(username)
-                        save_db(db)
-                await websocket.send(json.dumps({"status": "error", "msg": f"Античіт: Заборонений процес {detected_process}"}))
-                await websocket.close()
-                return
+        # 3. Підбір предметів
+        for i in range(len(game_state['pickups']) - 1, -1, -1):
+            pick = game_state['pickups'][i]
+            for pl in game_state['players'].values():
+                if pl['isAlive'] and math.hypot(pl['x'] - pick['x'], pl['y'] - pick['y']) < 35:
+                    if pick['type'] == 'fuel':
+                        game_state['teamFuel'] = min(game_state['maxFuel'], game_state['teamFuel'] + 15)
+                    elif pick['type'] == 'fuel_big':
+                        game_state['teamFuel'] = min(game_state['maxFuel'], game_state['teamFuel'] + 40)
+                    elif pick['type'] == 'medkit':
+                        pl['hp'] = min(pl['maxHp'], pl['hp'] + 40)
+                    game_state['pickups'].pop(i)
+                    check_base_condition()
+                    break
 
-            # Авторизовані ігрові дії з перевіркою валідності
-            elif username and websocket in clients:
-                p_data = clients[websocket]
+        # 4. Перевірка перемоги
+        if game_state['phase'] == 2 and game_state['evacTimer'] <= 0:
+            in_zone = [p for p in active_players if math.hypot(p['x'] - EVAC_ZONE['x'], p['y'] - EVAC_ZONE['y']) < EVAC_ZONE['r']]
+            if in_zone and len(in_zone) == len(active_players):
+                game_state['phase'] = 3
 
-                # 1. ЗАХИСТ ВІД SPEEDHACK, TELEPORT ТА FLYHACK
-                if action == "move":
-                    new_pos = req.get("pos")
-                    new_rot = req.get("rot")
-                    if not new_pos or len(new_pos) != 3:
-                        continue
+        # Відправка стану гри всім клієнтам
+        await sio.emit('stateUpdate', game_state)
+        await asyncio.sleep(1 / 30)
 
-                    dt = max(0.001, now - p_data["last_move_time"])
-                    p_data["last_move_time"] = now
+# Роздача статичних файлів HTML
+async def index_handler(request):
+    return web.FileResponse(os.path.join(os.path.dirname(__file__), 'public', 'index.html'))
 
-                    # Розрахунок дистанції переміщення
-                    dx = new_pos[0] - p_data["x"]
-                    dz = new_pos[2] - p_data["z"]
-                    move_dist = math.hypot(dx, dz)
-                    max_allowed = (MAX_RUN_SPEED * dt) + 0.8  # Допуск на пінг / ривок
+app.router.add_get('/', index_handler)
 
-                    # Перевірка висоти (Flyhack)
-                    if new_pos[1] > 12.0 or new_pos[1] < 0.0:
-                        p_data["violation_flags"] += 1
-                        continue  # Ігноруємо спробу літати або провалюватися під мапу
+async def start_background_tasks(app):
+    app['game_loop'] = asyncio.create_task(game_loop())
 
-                    # Перевірка швидкості (Speedhack/Teleport)
-                    if move_dist > max_allowed:
-                        p_data["violation_flags"] += 1
-                        # Відхиляємо рух і залишаємо старі координати
-                        continue
+async def cleanup_background_tasks(app):
+    app['game_loop'].cancel()
+    await app['game_loop']
 
-                    # Якщо все чисто — оновлюємо позицію
-                    p_data["x"] = new_pos[0]
-                    p_data["y"] = new_pos[1]
-                    p_data["z"] = new_pos[2]
-                    p_data["yaw"] = new_rot[0]
-                    p_data["pitch"] = new_rot[1]
+app.on_startup.append(start_background_tasks)
+app.on_cleanup.append(cleanup_background_tasks)
 
-                # 2. ЗАХИСТ ВІД LONG-HIT ТА AUTO-CLICKER (HARVEST)
-                elif action == "harvest":
-                    nid = req.get("node_id")
-                    if now - p_data["last_harvest_time"] < MIN_HARVEST_INTERVAL:
-                        continue # Спам кліків / чіт-клікер блокується
-                    
-                    p_data["last_harvest_time"] = now
-
-                    if nid in nodes and nodes[nid]["hp"] > 0:
-                        node = nodes[nid]
-                        # Перевірка дистанції (Reach Hack)
-                        dist_to_node = math.hypot(node["x"] - p_data["x"], node["z"] - p_data["z"])
-                        if dist_to_node <= MAX_REACH_DIST:
-                            node["hp"] -= 1
-                            res_type = node["type"]
-                            add_amt = 15 if res_type == "tree" else 12
-                            p_data["inv"]["wood" if res_type == "tree" else "stone"] = p_data["inv"].get("wood" if res_type == "tree" else "stone", 0) + add_amt
-                            db["users"][username]["inv"] = p_data["inv"]
-                            save_db(db)
-
-                # 3. ЗАХИСТ ВІД ФЕЙКОВОГО БУДІВНИЦТВА ТА БЕЗКОШТОВНИХ СТІН
-                elif action == "build":
-                    btype = req.get("build_type")
-                    bpos = req.get("pos")
-                    if not bpos or now - p_data["last_build_time"] < MIN_BUILD_INTERVAL:
-                        continue
-
-                    p_data["last_build_time"] = now
-                    dist_to_build = math.hypot(bpos[0] - p_data["x"], bpos[2] - p_data["z"])
-                    if dist_to_build > MAX_REACH_DIST + 2.0:
-                        continue # Будівництво за кілометр заборонено
-
-                    cost = 150 if btype == "wood_foundation" else 100
-                    if p_data["inv"].get("wood", 0) >= cost:
-                        p_data["inv"]["wood"] -= cost
-                        building_counter += 1
-                        buildings.append({
-                            "id": building_counter, "type": btype,
-                            "x": bpos[0], "y": bpos[1], "z": bpos[2],
-                            "owner": username
-                        })
-                        db["users"][username]["inv"] = p_data["inv"]
-                        save_db(db)
-
-                # 4. ЗАХИСТ ВІД ЧІТ-КРАФТУ
-                elif action == "craft":
-                    iid = req.get("item_id")
-                    if iid in CRAFTING_RECIPES:
-                        cost = CRAFTING_RECIPES[iid]["cost"]
-                        # Сервер сам перевіряє наявність ресурсів
-                        if all(p_data["inv"].get(r, 0) >= c for r, c in cost.items()):
-                            for r, c in cost.items():
-                                p_data["inv"][r] -= c
-                            p_data["inv"][iid] = p_data["inv"].get(iid, 0) + 1
-                            db["users"][username]["inv"] = p_data["inv"]
-                            save_db(db)
-
-                elif action == "add_friend":
-                    tgt = req.get("target")
-                    if tgt in db["users"] and tgt != username and tgt not in p_data["friends"]:
-                        p_data["friends"].append(tgt)
-                        db["users"][username]["friends"] = p_data["friends"]
-                        save_db(db)
-    finally:
-        if websocket in clients:
-            del clients[websocket]
-
-async def main():
-    print(f"[*] Rust Anti-Cheat Server захищено та запущено на порту {PORT}")
-    asyncio.create_task(broadcast())
-    async with websockets.serve(handler, "0.0.0.0", PORT):
-        await asyncio.Future()
-
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == '__main__':
+    print(f"[PYTHON SERVER] Сервер запускається на порту {PORT}...")
+    web.run_app(app, port=PORT)
