@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import bcrypt
 import jwt
+import uvicorn
 
 # Configuration
 R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "4cf18f6b81f018297ba7018547ad6005")
@@ -27,7 +28,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# R2 Storage Provider with fallback to local filesystem for offline/dev
+# R2 Storage Provider with fallback to local storage
 s3_client = None
 if R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY:
     try:
@@ -49,7 +50,7 @@ LOCAL_STORAGE_DIR = "storage"
 os.makedirs(LOCAL_STORAGE_DIR, exist_ok=True)
 
 def write_json_file(path_key: str, data: dict):
-    """Saves dict as JSON either into Cloudflare R2 or local storage."""
+    """Saves dict as JSON into Cloudflare R2 or local storage."""
     payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
     if s3_client:
         s3_client.put_object(
@@ -126,7 +127,7 @@ class PlaceBlock(BaseModel):
     pos: List[float] # [x, y, z]
     size: List[float] # [sx, sy, sz]
     color: str # hex string e.g. "#FF0000"
-    power: Optional[float] = 10.0 # for trampoline or speedpad
+    power: Optional[float] = 10.0
 
 class PlaceData(BaseModel):
     id: Optional[str] = None
@@ -142,7 +143,7 @@ def root():
     return {
         "status": "online",
         "service": "Roblox-Style Game API",
-        "storage": "Cloudflare R2" if s3_client else "Local Cache (Set R2 keys in env)",
+        "storage": "Cloudflare R2" if s3_client else "Local Cache",
         "time": datetime.datetime.utcnow().isoformat()
     }
 
@@ -189,7 +190,6 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
     place_id = place.id or str(uuid.uuid4())[:8]
     place_key = f"places/{place_id}.json"
     
-    # Check if place already exists and user is owner
     existing = read_json_file(place_key)
     if existing and existing.get("author") != current_user:
         raise HTTPException(status_code=403, detail="Ви не є автором цього плейса")
@@ -208,7 +208,6 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
     
     write_json_file(place_key, place_record)
     
-    # Update global index of places
     index_data = read_json_file("places_index.json") or {"places": []}
     places_list = [p for p in index_data.get("places", []) if p.get("id") != place_id]
     places_list.insert(0, {
@@ -218,7 +217,7 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
         "block_count": len(place.blocks),
         "updated_at": now_str
     })
-    index_data["places"] = places_list[:100] # keep last 100
+    index_data["places"] = places_list[:100]
     write_json_file("places_index.json", index_data)
     
     return {"status": "success", "id": place_id, "message": "Плейс успішно збережено у Cloudflare R2"}
@@ -235,3 +234,10 @@ def get_place(place_id: str):
     if not place_record:
         raise HTTPException(status_code=404, detail="Плейс не знайдено")
     return place_record
+
+# Server entry point for Render
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    print(f"Starting server on port {port}...")
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
