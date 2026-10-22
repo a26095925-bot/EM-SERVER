@@ -24,6 +24,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "")
 if len(JWT_SECRET.encode("utf-8")) < 32:
     raise RuntimeError("JWT_SECRET must be configured with at least 32 bytes of random data")
 JWT_ALGORITHM = "HS256"
+OWNER_USERNAMES = {name.strip().lower() for name in os.getenv("OWNER_USERNAMES", "mrkotik,arsen2014a").split(",") if name.strip()}
 ADMIN_USERNAMES = {name.strip().lower() for name in os.getenv("ADMIN_USERNAMES", "").split(",") if name.strip()}
 PLACE_VISITS: Dict[str, int] = {}
 
@@ -117,6 +118,35 @@ def read_json_file(path_key: str) -> Optional[dict]:
         with open(full_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
+def delete_json_file(path_key: str):
+    if s3_client:
+        s3_client.delete_object(Bucket=R2_BUCKET_NAME, Key=path_key)
+        return
+    full_path = local_storage_path(path_key)
+    if os.path.exists(full_path):
+        os.remove(full_path)
+
+def admin_assignment_state() -> tuple[set[str], set[str]]:
+    state = read_json_file("admin/admins.json") or {}
+    saved = state.get("admins", []) if isinstance(state, dict) else []
+    revoked = state.get("revoked", []) if isinstance(state, dict) else []
+    if not isinstance(saved, list): saved = []
+    if not isinstance(revoked, list): revoked = []
+    valid = lambda values: {str(name).strip().lower() for name in values
+                            if re.fullmatch(r"[a-z0-9_]{3,24}", str(name).strip().lower())}
+    return valid(saved), valid(revoked)
+
+def assigned_admin_usernames() -> set[str]:
+    return admin_assignment_state()[0]
+
+def is_owner(username: str) -> bool:
+    return username.strip().lower() in OWNER_USERNAMES
+
+def is_admin(username: str) -> bool:
+    normalized = username.strip().lower()
+    assigned, revoked = admin_assignment_state()
+    return normalized in OWNER_USERNAMES or (normalized in ADMIN_USERNAMES and normalized not in revoked) or normalized in assigned
+
 def hash_password(password: str) -> str:
     salt = bcrypt.gensalt()
     hashed = bcrypt.hashpw(password.encode("utf-8"), salt)
@@ -147,8 +177,13 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> str:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 def require_admin(username: str = Depends(get_current_user)) -> str:
-    if username.lower() not in ADMIN_USERNAMES:
+    if not is_admin(username):
         raise HTTPException(status_code=403, detail="Адмін-доступ не налаштовано для цього акаунта")
+    return username.lower()
+
+def require_owner(username: str = Depends(get_current_user)) -> str:
+    if not is_owner(username):
+        raise HTTPException(status_code=403, detail="Ця дія доступна лише власнику гри")
     return username.lower()
 
 # Models
@@ -235,6 +270,21 @@ class PlaceData(BaseModel):
             raise ValueError("description is too long")
         return value
 
+class PlaceMetadata(BaseModel):
+    title: str = Field(..., min_length=1, max_length=60)
+    description: Optional[str] = Field(default="", max_length=2000)
+
+    @field_validator("title")
+    @classmethod
+    def validate_metadata_title(cls, value):
+        if not value.strip():
+            raise ValueError("title cannot be blank")
+        return value.strip()
+
+class AdminManagementRequest(BaseModel):
+    action: str = Field(..., pattern="^(grant|revoke)$")
+    username: str = Field(..., min_length=3, max_length=24)
+
 def normalize_username(value: str) -> str:
     username = value.strip().lower()
     if not re.fullmatch(r"[a-z0-9_]{3,24}", username):
@@ -304,7 +354,7 @@ def login(req: AuthRequest, request: Request):
 
 @app.get("/api/auth/me")
 def me(current_user: str = Depends(get_current_user)):
-    return {"status": "ok", "username": current_user}
+    return {"status": "ok", "username": current_user, "is_admin": is_admin(current_user), "is_owner": is_owner(current_user)}
 
 @app.get("/api/skins/me")
 def get_my_skin(current_user: str = Depends(get_current_user)):
@@ -378,6 +428,51 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
 def list_places():
     index_data = read_json_file("places_index.json") or {"places": []}
     return index_data
+
+@app.get("/api/places/mine")
+def list_my_places(current_user: str = Depends(get_current_user)):
+    index_data = read_json_file("places_index.json") or {"places": []}
+    places = [item for item in index_data.get("places", [])
+              if isinstance(item, dict) and str(item.get("author", "")).lower() == current_user.lower()]
+    return {"places": places}
+
+@app.patch("/api/places/{place_id}")
+def update_place_metadata(place_id: str, metadata: PlaceMetadata, current_user: str = Depends(get_current_user)):
+    validate_place_id(place_id)
+    key = f"places/{place_id}.json"
+    place = read_json_file(key)
+    if not place:
+        raise HTTPException(status_code=404, detail="Плейс не знайдено")
+    if str(place.get("author", "")).lower() != current_user.lower():
+        raise HTTPException(status_code=403, detail="Ви не є автором цього плейса")
+    place["title"] = metadata.title
+    place["description"] = metadata.description or ""
+    place["updated_at"] = datetime.datetime.utcnow().isoformat()
+    write_json_file(key, place)
+    index_data = read_json_file("places_index.json") or {"places": []}
+    for item in index_data.get("places", []):
+        if isinstance(item, dict) and item.get("id") == place_id:
+            item["title"] = place["title"]
+            item["updated_at"] = place["updated_at"]
+            break
+    write_json_file("places_index.json", index_data)
+    return {"status": "success", "id": place_id, "title": place["title"]}
+
+@app.delete("/api/places/{place_id}")
+def delete_place(place_id: str, current_user: str = Depends(get_current_user)):
+    validate_place_id(place_id)
+    key = f"places/{place_id}.json"
+    place = read_json_file(key)
+    if not place:
+        raise HTTPException(status_code=404, detail="Плейс не знайдено")
+    if str(place.get("author", "")).lower() != current_user.lower():
+        raise HTTPException(status_code=403, detail="Ви не є автором цього плейса")
+    delete_json_file(key)
+    index_data = read_json_file("places_index.json") or {"places": []}
+    index_data["places"] = [item for item in index_data.get("places", [])
+                             if not isinstance(item, dict) or item.get("id") != place_id]
+    write_json_file("places_index.json", index_data)
+    return {"status": "success", "id": place_id}
 
 @app.get("/api/places/{place_id}")
 def get_place(place_id: str):
@@ -470,9 +565,37 @@ async def developer_overview(current_user: str = Depends(require_admin)):
         item["plays"] = PLACE_VISITS.get(str(item.get("id", "")), 0)
         places.append(item)
     places.sort(key=lambda item: (item.get("plays", 0), item.get("updated_at", "")), reverse=True)
-    return {"username": current_user, "places": places, "players": await multiplayer_rooms.online_users(),
+    owned_places = [item for item in places if str(item.get("author", "")).lower() == current_user.lower()]
+    return {"username": current_user, "is_owner": is_owner(current_user), "places": places, "my_places": owned_places, "players": await multiplayer_rooms.online_users(),
             "muted": sorted(multiplayer_rooms.muted_users), "banned": sorted(multiplayer_rooms.banned_users),
             "plays_scope": "відвідування з моменту запуску сервера"}
+
+@app.get("/api/admin/admins")
+def get_admins(current_user: str = Depends(require_owner)):
+    assigned, revoked = admin_assignment_state()
+    return {"owners": sorted(OWNER_USERNAMES), "admins": sorted(OWNER_USERNAMES | assigned | (ADMIN_USERNAMES - revoked))}
+
+@app.post("/api/admin/admins")
+def update_admin(request: AdminManagementRequest, current_user: str = Depends(require_owner)):
+    username = normalize_username(request.username)
+    assigned, revoked = admin_assignment_state()
+    if request.action == "grant":
+        if username in OWNER_USERNAMES:
+            return {"status": "success", "action": "already_owner", "username": username}
+        if not read_json_file(f"users/{username}.json"):
+            raise HTTPException(status_code=404, detail="Користувача з таким логіном не знайдено")
+        assigned.add(username)
+        revoked.discard(username)
+    else:
+        if username in OWNER_USERNAMES:
+            raise HTTPException(status_code=400, detail="Власника гри не можна зняти адміністратором")
+        if username not in assigned and username not in ADMIN_USERNAMES:
+            raise HTTPException(status_code=404, detail="Цього адміністратора немає у списку")
+        assigned.discard(username)
+        revoked.add(username)
+    write_json_file("admin/admins.json", {"admins": sorted(assigned), "revoked": sorted(revoked)})
+    return {"status": "success", "action": request.action, "username": username,
+            "admins": sorted(OWNER_USERNAMES | assigned | (ADMIN_USERNAMES - revoked))}
 
 @app.post("/api/admin/action")
 async def admin_action(request: AdminAction, current_user: str = Depends(require_admin)):
@@ -583,3 +706,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     print(f"Starting server with Anti-Cheat & Bot Protection on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
+
