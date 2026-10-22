@@ -249,10 +249,16 @@ def validate_place_id(value: Optional[str]) -> Optional[str]:
 # Routes
 @app.get("/")
 def root():
+    websocket_route = any(
+        getattr(route, "path", None) == "/ws/{place_id}"
+        for route in app.routes
+    )
     return {
         "status": "online",
         "service": "Roblox-Style Game API with multiplayer presence",
         "storage": "Cloudflare R2" if s3_client else "Local Cache",
+        "multiplayer_websocket": websocket_route,
+        "websocket_path": "/ws/{place_id}" if websocket_route else None,
         "time": datetime.datetime.utcnow().isoformat()
     }
 
