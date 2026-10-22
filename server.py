@@ -1,11 +1,15 @@
 import os
 import json
+import math
+import re
 import uuid
+import time
 import datetime
-from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, Header, Depends, status
+import asyncio
+from typing import Optional, List, Dict
+from fastapi import FastAPI, HTTPException, Header, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 import bcrypt
 import jwt
 import uvicorn
@@ -15,18 +19,42 @@ R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "4cf18f6b81f018297ba7018547ad6005")
 R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "aient")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
-JWT_SECRET = os.getenv("JWT_SECRET", "super_secret_roblox_style_jwt_key_2026")
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+if len(JWT_SECRET.encode("utf-8")) < 32:
+    raise RuntimeError("JWT_SECRET must be configured with at least 32 bytes of random data")
 JWT_ALGORITHM = "HS256"
 
-app = FastAPI(title="Roblox-Style Game Backend", version="1.0.0")
+app = FastAPI(title="Roblox-Style Game Backend", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# In-memory Rate Limiting / Bot Protection
+RATE_LIMIT_STORE: Dict[str, List[float]] = {}
+
+def check_rate_limit(client_ip: str, action: str, max_calls: int, window_sec: int = 60):
+    """Protects against bot spam and brute force attacks."""
+    now = time.time()
+    key = f"{client_ip}:{action}"
+    timestamps = RATE_LIMIT_STORE.get(key, [])
+    # keep only within window
+    timestamps = [t for t in timestamps if now - t < window_sec]
+    if len(timestamps) >= max_calls:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Забагато запитів від вашого IP. Зачекайте {window_sec} секунд (Захист від ботів)."
+        )
+    timestamps.append(now)
+    RATE_LIMIT_STORE[key] = timestamps
+    if len(RATE_LIMIT_STORE) > 10000:
+        for stale_key, values in list(RATE_LIMIT_STORE.items()):
+            if not values or now - values[-1] >= window_sec:
+                RATE_LIMIT_STORE.pop(stale_key, None)
 
 # R2 Storage Provider with fallback to local storage
 s3_client = None
@@ -49,8 +77,14 @@ if R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY:
 LOCAL_STORAGE_DIR = "storage"
 os.makedirs(LOCAL_STORAGE_DIR, exist_ok=True)
 
+def local_storage_path(path_key: str) -> str:
+    root = os.path.realpath(LOCAL_STORAGE_DIR)
+    candidate = os.path.realpath(os.path.join(root, path_key))
+    if os.path.commonpath([root, candidate]) != root:
+        raise ValueError("Storage key escapes storage root")
+    return candidate
+
 def write_json_file(path_key: str, data: dict):
-    """Saves dict as JSON into Cloudflare R2 or local storage."""
     payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
     if s3_client:
         s3_client.put_object(
@@ -60,13 +94,12 @@ def write_json_file(path_key: str, data: dict):
             ContentType="application/json"
         )
     else:
-        full_path = os.path.join(LOCAL_STORAGE_DIR, path_key)
+        full_path = local_storage_path(path_key)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         with open(full_path, "wb") as f:
             f.write(payload)
 
 def read_json_file(path_key: str) -> Optional[dict]:
-    """Reads JSON from Cloudflare R2 or local storage."""
     if s3_client:
         try:
             resp = s3_client.get_object(Bucket=R2_BUCKET_NAME, Key=path_key)
@@ -75,20 +108,18 @@ def read_json_file(path_key: str) -> Optional[dict]:
         except Exception:
             return None
     else:
-        full_path = os.path.join(LOCAL_STORAGE_DIR, path_key)
+        full_path = local_storage_path(path_key)
         if not os.path.exists(full_path):
             return None
         with open(full_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
 def hash_password(password: str) -> str:
-    """Securely hashes password using bcrypt with salt."""
     salt = bcrypt.gensalt()
     hashed = bcrypt.hashpw(password.encode("utf-8"), salt)
     return hashed.decode("utf-8")
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verifies plain password against bcrypt hash."""
     return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
 
 def create_jwt_token(username: str) -> str:
@@ -117,39 +148,112 @@ class AuthRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=24)
     password: str = Field(..., min_length=4, max_length=64)
 
+    @field_validator("password")
+    @classmethod
+    def bcrypt_byte_limit(cls, value):
+        if len(value.encode("utf-8")) > 72:
+            raise ValueError("Password exceeds bcrypt's 72-byte limit")
+        return value
+
 class AuthResponse(BaseModel):
     status: str
     username: str
     token: str
 
 class PlaceBlock(BaseModel):
-    type: str # "solid", "spawn", "checkpoint", "lava", "trampoline", "speedpad"
-    pos: List[float] # [x, y, z]
-    size: List[float] # [sx, sy, sz]
-    color: str # hex string e.g. "#FF0000"
-    power: Optional[float] = 10.0
+    type: str = Field(..., pattern="^(solid|spawn|checkpoint|lava|trampoline|speedpad|light|door)$")
+    pos: List[float]
+    size: List[float]
+    color: str
+    power: Optional[float] = Field(default=10.0, ge=0, le=100)
+    script: Optional[str] = None
+
+    @field_validator("pos", "size")
+    @classmethod
+    def validate_vector(cls, values, info):
+        if len(values) != 3 or any(not math.isfinite(v) or abs(v) > 10000 for v in values):
+            raise ValueError(f"{info.field_name} must contain three finite values within +/-10000")
+        if info.field_name == "size" and any(v <= 0 or v > 512 for v in values):
+            raise ValueError("size values must be greater than 0 and at most 512")
+        return values
+
+    @field_validator("script")
+    @classmethod
+    def bound_script(cls, value):
+        if value is not None and len(value) > 2000:
+            raise ValueError("script is too long")
+        return value
+
+    @field_validator("color")
+    @classmethod
+    def validate_color(cls, value):
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            raise ValueError("color must be a six-digit hex value")
+        return value
 
 class PlaceData(BaseModel):
-    id: Optional[str] = None
+    id: Optional[str] = Field(default=None, min_length=1, max_length=36)
     title: str = Field(..., min_length=1, max_length=60)
     description: Optional[str] = ""
     author: Optional[str] = ""
-    spawn: Optional[List[float]] = [0, 2, 0]
-    blocks: List[PlaceBlock] = []
+    spawn: Optional[List[float]] = Field(default_factory=lambda: [0, 2, 0])
+    blocks: List[PlaceBlock] = Field(default_factory=list)
+
+    @field_validator("blocks")
+    @classmethod
+    def bound_blocks(cls, values):
+        if len(values) > 2000:
+            raise ValueError("A place may contain at most 2000 blocks")
+        return values
+
+    @field_validator("spawn")
+    @classmethod
+    def validate_spawn(cls, values):
+        if values is not None and (len(values) != 3 or any(not math.isfinite(v) or abs(v) > 10000 for v in values)):
+            raise ValueError("spawn must contain three finite coordinates")
+        return values
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value):
+        if not value.strip():
+            raise ValueError("title cannot be blank")
+        return value.strip()
+
+    @field_validator("description")
+    @classmethod
+    def bound_description(cls, value):
+        if value is not None and len(value) > 2000:
+            raise ValueError("description is too long")
+        return value
+
+def normalize_username(value: str) -> str:
+    username = value.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_]{3,24}", username):
+        raise HTTPException(status_code=400, detail="Логін: 3–24 символи a-z, 0-9 або _")
+    return username
+
+def validate_place_id(value: Optional[str]) -> Optional[str]:
+    if value is not None and not re.fullmatch(r"[a-fA-F0-9-]{1,36}", value):
+        raise HTTPException(status_code=400, detail="Некоректний ID плейса")
+    return value
 
 # Routes
 @app.get("/")
 def root():
     return {
         "status": "online",
-        "service": "Roblox-Style Game API",
+        "service": "Roblox-Style Game API with multiplayer presence",
         "storage": "Cloudflare R2" if s3_client else "Local Cache",
         "time": datetime.datetime.utcnow().isoformat()
     }
 
 @app.post("/api/auth/register", response_model=AuthResponse)
-def register(req: AuthRequest):
-    username = req.username.strip().lower()
+def register(req: AuthRequest, request: Request):
+    ip = request.client.host if request.client else "unknown"
+    check_rate_limit(ip, "register", max_calls=4, window_sec=60)
+
+    username = normalize_username(req.username)
     user_key = f"users/{username}.json"
     
     existing = read_json_file(user_key)
@@ -167,8 +271,11 @@ def register(req: AuthRequest):
     return AuthResponse(status="success", username=username, token=token)
 
 @app.post("/api/auth/login", response_model=AuthResponse)
-def login(req: AuthRequest):
-    username = req.username.strip().lower()
+def login(req: AuthRequest, request: Request):
+    ip = request.client.host if request.client else "unknown"
+    check_rate_limit(ip, "login", max_calls=12, window_sec=60)
+
+    username = normalize_username(req.username)
     user_key = f"users/{username}.json"
     
     user_record = read_json_file(user_key)
@@ -187,7 +294,8 @@ def me(current_user: str = Depends(get_current_user)):
 
 @app.post("/api/places/save")
 def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
-    place_id = place.id or str(uuid.uuid4())[:8]
+    # Server-side validation against malicious / oversized payloads
+    place_id = validate_place_id(place.id) or uuid.uuid4().hex
     place_key = f"places/{place_id}.json"
     
     existing = read_json_file(place_key)
@@ -220,7 +328,7 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
     index_data["places"] = places_list[:100]
     write_json_file("places_index.json", index_data)
     
-    return {"status": "success", "id": place_id, "message": "Плейс успішно збережено у Cloudflare R2"}
+    return {"status": "success", "id": place_id, "message": "Плейс збережено в Cloudflare R2"}
 
 @app.get("/api/places/list")
 def list_places():
@@ -229,15 +337,89 @@ def list_places():
 
 @app.get("/api/places/{place_id}")
 def get_place(place_id: str):
+    validate_place_id(place_id)
     place_key = f"places/{place_id}.json"
     place_record = read_json_file(place_key)
     if not place_record:
         raise HTTPException(status_code=404, detail="Плейс не знайдено")
     return place_record
 
-# Server entry point for Render
+# Ephemeral multiplayer sessions: players receive presence/positions only;
+# world saving and collision remain separate from this real-time channel.
+class MultiplayerRooms:
+    def __init__(self):
+        self.rooms: Dict[str, Dict[WebSocket, str]] = {}
+        self.lock = asyncio.Lock()
+
+    async def join(self, room: str, socket: WebSocket, username: str):
+        async with self.lock:
+            self.rooms.setdefault(room, {})[socket] = username
+            peers = list(self.rooms[room].values())
+        await socket.send_json({"type": "roster", "players": peers})
+        await self.broadcast(room, {"type": "joined", "username": username}, exclude=socket)
+
+    async def leave(self, room: str, socket: WebSocket):
+        async with self.lock:
+            peers = self.rooms.get(room, {})
+            username = peers.pop(socket, None)
+            if not peers:
+                self.rooms.pop(room, None)
+        if username:
+            await self.broadcast(room, {"type": "left", "username": username})
+
+    async def broadcast(self, room: str, payload: dict, exclude: Optional[WebSocket] = None):
+        async with self.lock:
+            peers = list(self.rooms.get(room, {}).keys())
+        for peer in peers:
+            if peer is exclude:
+                continue
+            try:
+                await peer.send_json(payload)
+            except Exception:
+                await self.leave(room, peer)
+
+multiplayer_rooms = MultiplayerRooms()
+
+@app.websocket("/ws/{place_id}")
+async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
+    try:
+        validate_place_id(place_id)
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        username = payload.get("sub")
+        if not username:
+            raise ValueError("missing subject")
+    except Exception:
+        await websocket.close(code=1008, reason="Invalid session or place")
+        return
+
+    await websocket.accept()
+    room = place_id
+    await multiplayer_rooms.join(room, websocket, username)
+    try:
+        while True:
+            message = await websocket.receive_json()
+            if not isinstance(message, dict) or message.get("type") != "state":
+                continue
+            coords = message.get("position")
+            if not isinstance(coords, list) or len(coords) != 3:
+                continue
+            try:
+                coords = [float(v) for v in coords]
+                if any(not math.isfinite(v) or abs(v) > 10000 for v in coords):
+                    continue
+            except (TypeError, ValueError):
+                continue
+            await multiplayer_rooms.broadcast(room, {
+                "type": "state", "username": username,
+                "position": coords,
+                "yaw": float(message.get("yaw", 0.0)) % 360.0
+            }, exclude=websocket)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await multiplayer_rooms.leave(room, websocket)
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    print(f"Starting server on port {port}...")
+    print(f"Starting server with Anti-Cheat & Bot Protection on port {port}...")
     uvicorn.run(app, host="0.0.0.0", port=port)
-
