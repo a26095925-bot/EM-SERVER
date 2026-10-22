@@ -24,6 +24,8 @@ JWT_SECRET = os.getenv("JWT_SECRET", "")
 if len(JWT_SECRET.encode("utf-8")) < 32:
     raise RuntimeError("JWT_SECRET must be configured with at least 32 bytes of random data")
 JWT_ALGORITHM = "HS256"
+ADMIN_USERNAMES = {name.strip().lower() for name in os.getenv("ADMIN_USERNAMES", "").split(",") if name.strip()}
+PLACE_VISITS: Dict[str, int] = {}
 
 app = FastAPI(title="Roblox-Style Game Backend", version="1.1.0")
 
@@ -143,6 +145,11 @@ def get_current_user(authorization: Optional[str] = Header(None)) -> str:
         return username
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+def require_admin(username: str = Depends(get_current_user)) -> str:
+    if username.lower() not in ADMIN_USERNAMES:
+        raise HTTPException(status_code=403, detail="Адмін-доступ не налаштовано для цього акаунта")
+    return username.lower()
 
 # Models
 class AuthRequest(BaseModel):
@@ -373,6 +380,7 @@ def get_place(place_id: str):
     place_record = read_json_file(place_key)
     if not place_record:
         raise HTTPException(status_code=404, detail="Плейс не знайдено")
+    PLACE_VISITS[place_id] = PLACE_VISITS.get(place_id, 0) + 1
     return place_record
 
 # Ephemeral multiplayer sessions: players receive presence/positions only;
@@ -381,6 +389,10 @@ class MultiplayerRooms:
     def __init__(self):
         self.rooms: Dict[str, Dict[WebSocket, str]] = {}
         self.lock = asyncio.Lock()
+        try: state = read_json_file("admin/moderation.json") or {}
+        except Exception: state = {}
+        self.banned_users: set[str] = set(state.get("banned", []))
+        self.muted_users: set[str] = set(state.get("muted", []))
 
     async def join(self, room: str, socket: WebSocket, username: str):
         async with self.lock:
@@ -409,7 +421,78 @@ class MultiplayerRooms:
             except Exception:
                 await self.leave(room, peer)
 
+    async def online_users(self) -> List[str]:
+        async with self.lock:
+            return sorted({name for peers in self.rooms.values() for name in peers.values()})
+
+    async def moderate(self, action: str, target: str, value=None):
+        async with self.lock:
+            sockets = [(room, ws) for room, peers in self.rooms.items() for ws, name in peers.items() if name == target]
+            if action == "ban": self.banned_users.add(target)
+            elif action == "unban": self.banned_users.discard(target)
+            elif action == "mute": self.muted_users.add(target)
+            elif action == "unmute": self.muted_users.discard(target)
+            moderation_state = {"banned": sorted(self.banned_users), "muted": sorted(self.muted_users)}
+        if action in {"ban", "unban", "mute", "unmute"}:
+            try: write_json_file("admin/moderation.json", moderation_state)
+            except Exception: pass
+        if action in {"kick", "ban"}:
+            for room, ws in sockets:
+                try: await ws.close(code=4001, reason="Removed by administrator")
+                except Exception: pass
+                await self.leave(room, ws)
+        elif action in {"head", "teleport"}:
+            payload = {"type": "admin_effect", "action": action, "value": value}
+            for _, ws in sockets:
+                try: await ws.send_json(payload)
+                except Exception: pass
+
+class AdminAction(BaseModel):
+    action: str = Field(..., max_length=16)
+    target: str = Field(..., min_length=3, max_length=24)
+    value: Optional[List[float] | float] = None
+
 multiplayer_rooms = MultiplayerRooms()
+
+@app.get("/api/dev/overview")
+async def developer_overview(current_user: str = Depends(require_admin)):
+    index_data = read_json_file("places_index.json") or {"places": []}
+    places = []
+    for place in index_data.get("places", [])[:100]:
+        if not isinstance(place, dict): continue
+        item = dict(place)
+        item["plays"] = PLACE_VISITS.get(str(item.get("id", "")), 0)
+        places.append(item)
+    places.sort(key=lambda item: (item.get("plays", 0), item.get("updated_at", "")), reverse=True)
+    return {"username": current_user, "places": places, "players": await multiplayer_rooms.online_users(),
+            "muted": sorted(multiplayer_rooms.muted_users), "banned": sorted(multiplayer_rooms.banned_users),
+            "plays_scope": "відвідування з моменту запуску сервера"}
+
+@app.post("/api/admin/action")
+async def admin_action(request: AdminAction, current_user: str = Depends(require_admin)):
+    target = request.target.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_]{3,24}", target):
+        raise HTTPException(status_code=400, detail="Некоректне ім’я гравця")
+    if target not in {u for room in multiplayer_rooms.rooms.values() for u in room.values()} and request.action not in {"unban", "unmute"}:
+        raise HTTPException(status_code=404, detail="Гравець не в мережі")
+    allowed = {"kick", "ban", "unban", "mute", "unmute", "head", "teleport"}
+    if request.action not in allowed:
+        raise HTTPException(status_code=400, detail="Невідома команда адміністратора")
+    if request.action == "head":
+        if not isinstance(request.value, (int, float)) or not math.isfinite(float(request.value)):
+            raise HTTPException(status_code=400, detail="Некоректний розмір голови")
+        value = max(1.0, min(3.0, float(request.value)))
+    elif request.action == "teleport":
+        if not isinstance(request.value, list) or len(request.value) != 3:
+            raise HTTPException(status_code=400, detail="Для телепортації потрібні координати X, Y, Z")
+        try: value = [float(v) for v in request.value]
+        except (ValueError, TypeError): raise HTTPException(status_code=400, detail="Некоректні координати")
+        if any(not math.isfinite(v) or abs(v) > 10000 for v in value):
+            raise HTTPException(status_code=400, detail="Координати за межами плейса")
+    else:
+        value = None
+    await multiplayer_rooms.moderate(request.action, target, value)
+    return {"status": "success", "action": request.action, "target": target}
 
 @app.websocket("/ws/{place_id}")
 async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
@@ -423,6 +506,9 @@ async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
         await websocket.close(code=1008, reason="Invalid session or place")
         return
 
+    if username.lower() in multiplayer_rooms.banned_users:
+        await websocket.close(code=1008, reason="Account is banned from multiplayer")
+        return
     await websocket.accept()
     room = place_id
     await multiplayer_rooms.join(room, websocket, username)
@@ -440,8 +526,11 @@ async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
                 text = re.sub(r"[\x00-\x1f\x7f]", " ", text).strip()[:220]
                 if not text:
                     continue
+                if username.lower() in multiplayer_rooms.muted_users:
+                    await websocket.send_json({"type": "notice", "message": "Ваш чат тимчасово вимкнено модератором."})
+                    continue
                 last_chat_at = now
-                await multiplayer_rooms.broadcast(room, {"type": "chat", "username": username, "message": text})
+                await multiplayer_rooms.broadcast(room, {"type": "chat", "username": username, "message": text}, exclude=websocket)
                 continue
             if message.get("type") != "state":
                 continue
@@ -455,6 +544,12 @@ async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
             except (TypeError, ValueError):
                 continue
             skin = message.get("skin", {})
+            try:
+                head_scale = float(message.get("head_scale", 1.0))
+                if not math.isfinite(head_scale): head_scale = 1.0
+                head_scale = max(1.0, min(3.0, head_scale))
+            except (TypeError, ValueError):
+                head_scale = 1.0
             if not isinstance(skin, dict) or len(json.dumps(skin, ensure_ascii=False)) > 4096:
                 skin = {}
             else:
@@ -470,6 +565,7 @@ async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
                 "type": "state", "username": username,
                 "position": coords,
                 "yaw": float(message.get("yaw", 0.0)) % 360.0,
+                "head_scale": head_scale,
                 "skin": skin
             }, exclude=websocket)
     except WebSocketDisconnect:
