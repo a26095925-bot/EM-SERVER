@@ -1,5 +1,6 @@
 import os
 import json
+import os
 import math
 import re
 import uuid
@@ -292,6 +293,35 @@ def login(req: AuthRequest, request: Request):
 def me(current_user: str = Depends(get_current_user)):
     return {"status": "ok", "username": current_user}
 
+@app.get("/api/skins/me")
+def get_my_skin(current_user: str = Depends(get_current_user)):
+    skin = read_json_file(f"skins/{current_user}.json")
+    if not skin:
+        raise HTTPException(status_code=404, detail="Скін ще не збережено")
+    return skin
+
+@app.put("/api/skins/me")
+def save_my_skin(payload: dict, current_user: str = Depends(get_current_user)):
+    if len(json.dumps(payload, ensure_ascii=False)) > 16_384:
+        raise HTTPException(status_code=413, detail="Дані скіна завеликі")
+    allowed = {"headColorHex", "torsoColorHex", "leftArmColorHex", "rightArmColorHex",
+               "leftLegColorHex", "rightLegColorHex", "hat", "face", "faceAsset"}
+    if set(payload) - allowed:
+        raise HTTPException(status_code=400, detail="Невідомі поля скіна")
+    for key in ("headColorHex", "torsoColorHex", "leftArmColorHex", "rightArmColorHex", "leftLegColorHex", "rightLegColorHex"):
+        value = payload.get(key)
+        if not isinstance(value, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            raise HTTPException(status_code=400, detail="Некоректний колір скіна")
+    if payload.get("hat") not in {"None", "Cap", "Fedora", "TopHat", "Helmet"}:
+        raise HTTPException(status_code=400, detail="Некоректний головний убір")
+    if payload.get("face") not in {"Smile", "Sunglasses", "Angry", "Cyborg"}:
+        raise HTTPException(status_code=400, detail="Некоректне стандартне обличчя")
+    face_asset = payload.get("faceAsset", "")
+    if not isinstance(face_asset, str) or (face_asset and not re.fullmatch(r"CLASSIC_FACES/[^/\\]{1,180}\.png", face_asset)):
+        raise HTTPException(status_code=400, detail="Некоректне ім’я ресурсу обличчя")
+    write_json_file(f"skins/{current_user}.json", payload)
+    return {"status": "success", "storage": "r2" if s3_client else "local"}
+
 @app.post("/api/places/save")
 def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
     # Server-side validation against malicious / oversized payloads
@@ -328,7 +358,8 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
     index_data["places"] = places_list[:100]
     write_json_file("places_index.json", index_data)
     
-    return {"status": "success", "id": place_id, "message": "Плейс збережено в Cloudflare R2"}
+    storage_message = "Cloudflare R2" if s3_client else "локальному сховищі сервера"
+    return {"status": "success", "id": place_id, "message": f"Плейс збережено у {storage_message}."}
 
 @app.get("/api/places/list")
 def list_places():
@@ -395,10 +426,24 @@ async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
     await websocket.accept()
     room = place_id
     await multiplayer_rooms.join(room, websocket, username)
+    last_chat_at = 0.0
     try:
         while True:
             message = await websocket.receive_json()
-            if not isinstance(message, dict) or message.get("type") != "state":
+            if not isinstance(message, dict):
+                continue
+            if message.get("type") == "chat":
+                now = time.monotonic()
+                text = message.get("message")
+                if now - last_chat_at < 0.6 or not isinstance(text, str):
+                    continue
+                text = re.sub(r"[\x00-\x1f\x7f]", " ", text).strip()[:220]
+                if not text:
+                    continue
+                last_chat_at = now
+                await multiplayer_rooms.broadcast(room, {"type": "chat", "username": username, "message": text})
+                continue
+            if message.get("type") != "state":
                 continue
             coords = message.get("position")
             if not isinstance(coords, list) or len(coords) != 3:
@@ -409,10 +454,23 @@ async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
                     continue
             except (TypeError, ValueError):
                 continue
+            skin = message.get("skin", {})
+            if not isinstance(skin, dict) or len(json.dumps(skin, ensure_ascii=False)) > 4096:
+                skin = {}
+            else:
+                allowed_skin_fields = {"headColorHex", "torsoColorHex", "leftArmColorHex", "rightArmColorHex",
+                                       "leftLegColorHex", "rightLegColorHex", "hat", "face", "faceAsset"}
+                skin = {key: value for key, value in skin.items() if key in allowed_skin_fields}
+                for color_key in ("headColorHex", "torsoColorHex", "leftArmColorHex", "rightArmColorHex", "leftLegColorHex", "rightLegColorHex"):
+                    if not isinstance(skin.get(color_key), str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", skin[color_key]):
+                        skin.pop(color_key, None)
+                if not isinstance(skin.get("faceAsset", ""), str) or (skin.get("faceAsset") and not re.fullmatch(r"CLASSIC_FACES/[^/\\]{1,180}\.png", skin["faceAsset"])):
+                    skin.pop("faceAsset", None)
             await multiplayer_rooms.broadcast(room, {
                 "type": "state", "username": username,
                 "position": coords,
-                "yaw": float(message.get("yaw", 0.0)) % 360.0
+                "yaw": float(message.get("yaw", 0.0)) % 360.0,
+                "skin": skin
             }, exclude=websocket)
     except WebSocketDisconnect:
         pass
