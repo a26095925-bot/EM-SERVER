@@ -9,7 +9,7 @@ import datetime
 import asyncio
 import base64
 from typing import Optional, List, Dict
-from fastapi import FastAPI, HTTPException, Header, Depends, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Header, Depends, Request, WebSocket, WebSocketDisconnect, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 import bcrypt
@@ -502,6 +502,23 @@ def get_place(place_id: str):
         raise HTTPException(status_code=404, detail="Плейс не знайдено")
     PLACE_VISITS[place_id] = PLACE_VISITS.get(place_id, 0) + 1
     return place_record
+
+@app.get("/api/places/{place_id}/thumbnail")
+def get_place_thumbnail(place_id: str):
+    validate_place_id(place_id)
+    place_record = read_json_file(f"places/{place_id}.json")
+    if not place_record:
+        raise HTTPException(status_code=404, detail="Плейс не знайдено")
+    encoded = place_record.get("thumbnail_png")
+    if not isinstance(encoded, str) or not encoded:
+        raise HTTPException(status_code=404, detail="Обкладинку не додано")
+    try:
+        image = base64.b64decode(encoded, validate=True)
+    except Exception:
+        raise HTTPException(status_code=500, detail="Обкладинка пошкоджена")
+    if len(image) > 1_000_000 or not image.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise HTTPException(status_code=500, detail="Обкладинка пошкоджена")
+    return Response(content=image, media_type="image/png", headers={"Cache-Control": "public, max-age=300"})
 
 # Ephemeral multiplayer sessions: players receive presence/positions only;
 # world saving and collision remain separate from this real-time channel.
