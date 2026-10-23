@@ -436,7 +436,7 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
         "has_thumbnail": bool(place.thumbnail_png),
         "updated_at": now_str
     })
-    index_data["places"] = places_list[:100]
+    index_data["places"] = places_list[:1000]
     write_json_file("places_index.json", index_data)
     
     storage_message = "Cloudflare R2" if s3_client else "локальному сховищі сервера"
@@ -595,7 +595,7 @@ multiplayer_rooms = MultiplayerRooms()
 async def developer_overview(current_user: str = Depends(get_current_user)):
     index_data = read_json_file("places_index.json") or {"places": []}
     own_places = []
-    for place in index_data.get("places", [])[:100]:
+    for place in index_data.get("places", [])[:1000]:
         if not isinstance(place, dict): continue
         if str(place.get("author", "")).lower() != current_user.lower(): continue
         item = dict(place)
@@ -609,7 +609,7 @@ async def developer_overview(current_user: str = Depends(get_current_user)):
 async def admin_overview(current_user: str = Depends(require_admin)):
     index_data = read_json_file("places_index.json") or {"places": []}
     places = []
-    for place in index_data.get("places", [])[:100]:
+    for place in index_data.get("places", [])[:1000]:
         if not isinstance(place, dict): continue
         item = dict(place)
         item["plays"] = PLACE_VISITS.get(str(item.get("id", "")), 0)
