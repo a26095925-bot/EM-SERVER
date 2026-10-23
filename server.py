@@ -7,6 +7,7 @@ import uuid
 import time
 import datetime
 import asyncio
+import base64
 from typing import Optional, List, Dict
 from fastapi import FastAPI, HTTPException, Header, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -204,11 +205,12 @@ class AuthResponse(BaseModel):
     token: str
 
 class PlaceBlock(BaseModel):
-    type: str = Field(..., pattern="^(solid|spawn|checkpoint|lava|trampoline|speedpad|light|door)$")
+    type: str = Field(..., pattern="^(solid|spawn|checkpoint|lava|trampoline|speedpad|damage|light|door)$")
     pos: List[float]
     size: List[float]
     color: str
     power: Optional[float] = Field(default=10.0, ge=0, le=100)
+    damage_interval: Optional[float] = Field(default=1.0, ge=0.1, le=10.0)
     script: Optional[str] = None
 
     @field_validator("pos", "size")
@@ -241,6 +243,7 @@ class PlaceData(BaseModel):
     author: Optional[str] = ""
     spawn: Optional[List[float]] = Field(default_factory=lambda: [0, 2, 0])
     blocks: List[PlaceBlock] = Field(default_factory=list)
+    thumbnail_png: Optional[str] = Field(default=None, max_length=1_400_000)
 
     @field_validator("blocks")
     @classmethod
@@ -270,9 +273,22 @@ class PlaceData(BaseModel):
             raise ValueError("description is too long")
         return value
 
+    @field_validator("thumbnail_png")
+    @classmethod
+    def validate_thumbnail(cls, value):
+        if not value:
+            return value
+        try:
+            image = base64.b64decode(value, validate=True)
+        except Exception:
+            raise ValueError("thumbnail_png must be valid base64")
+        if len(image) > 1_000_000 or not image.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise ValueError("thumbnail_png must be a valid PNG no larger than 1 MB")
+        return value
+
 class PlaceMetadata(BaseModel):
     title: str = Field(..., min_length=1, max_length=60)
-    description: Optional[str] = Field(default="", max_length=2000)
+    description: Optional[str] = Field(default=None, max_length=2000)
 
     @field_validator("title")
     @classmethod
@@ -404,7 +420,8 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
         "created_at": existing.get("created_at") if existing else now_str,
         "updated_at": now_str,
         "spawn": place.spawn,
-        "blocks": [b.dict() for b in place.blocks]
+        "blocks": [b.dict() for b in place.blocks],
+        "thumbnail_png": place.thumbnail_png
     }
     
     write_json_file(place_key, place_record)
@@ -416,6 +433,7 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
         "title": place.title,
         "author": current_user,
         "block_count": len(place.blocks),
+        "has_thumbnail": bool(place.thumbnail_png),
         "updated_at": now_str
     })
     index_data["places"] = places_list[:100]
@@ -446,7 +464,8 @@ def update_place_metadata(place_id: str, metadata: PlaceMetadata, current_user: 
     if str(place.get("author", "")).lower() != current_user.lower():
         raise HTTPException(status_code=403, detail="Ви не є автором цього плейса")
     place["title"] = metadata.title
-    place["description"] = metadata.description or ""
+    if metadata.description is not None:
+        place["description"] = metadata.description
     place["updated_at"] = datetime.datetime.utcnow().isoformat()
     write_json_file(key, place)
     index_data = read_json_file("places_index.json") or {"places": []}
@@ -556,7 +575,21 @@ class AdminAction(BaseModel):
 multiplayer_rooms = MultiplayerRooms()
 
 @app.get("/api/dev/overview")
-async def developer_overview(current_user: str = Depends(require_admin)):
+async def developer_overview(current_user: str = Depends(get_current_user)):
+    index_data = read_json_file("places_index.json") or {"places": []}
+    own_places = []
+    for place in index_data.get("places", [])[:100]:
+        if not isinstance(place, dict): continue
+        if str(place.get("author", "")).lower() != current_user.lower(): continue
+        item = dict(place)
+        item["plays"] = PLACE_VISITS.get(str(item.get("id", "")), 0)
+        own_places.append(item)
+    own_places.sort(key=lambda item: (item.get("plays", 0), item.get("updated_at", "")), reverse=True)
+    return {"username": current_user, "my_places": own_places,
+            "plays_scope": "відвідування власних плейсів з моменту запуску сервера"}
+
+@app.get("/api/admin/overview")
+async def admin_overview(current_user: str = Depends(require_admin)):
     index_data = read_json_file("places_index.json") or {"places": []}
     places = []
     for place in index_data.get("places", [])[:100]:
@@ -565,8 +598,8 @@ async def developer_overview(current_user: str = Depends(require_admin)):
         item["plays"] = PLACE_VISITS.get(str(item.get("id", "")), 0)
         places.append(item)
     places.sort(key=lambda item: (item.get("plays", 0), item.get("updated_at", "")), reverse=True)
-    owned_places = [item for item in places if str(item.get("author", "")).lower() == current_user.lower()]
-    return {"username": current_user, "is_owner": is_owner(current_user), "places": places, "my_places": owned_places, "players": await multiplayer_rooms.online_users(),
+    return {"username": current_user, "is_owner": is_owner(current_user), "places": places,
+            "players": await multiplayer_rooms.online_users(),
             "muted": sorted(multiplayer_rooms.muted_users), "banned": sorted(multiplayer_rooms.banned_users),
             "plays_scope": "відвідування з моменту запуску сервера"}
 
