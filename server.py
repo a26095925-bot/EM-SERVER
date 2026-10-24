@@ -147,6 +147,10 @@ class PlaceBlock(BaseModel):
     power: Optional[FiniteFloat] = Field(default=10.0, ge=0, le=100)
     script: Optional[str] = Field(default=None, max_length=4000)
 
+class PlaceLayerData(BaseModel):
+    name: str = Field(..., min_length=1, max_length=64)
+    visible: bool = True
+
 class PlaceData(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -157,6 +161,14 @@ class PlaceData(BaseModel):
     spawn: List[FiniteFloat] = Field(default_factory=lambda: [0, 2, 0], min_length=3, max_length=3)
     blocks: List[PlaceBlock] = Field(default_factory=list, max_length=4000)
     thumbnail_png: Optional[str] = Field(default=None, max_length=1_400_000)
+    layers: List[PlaceLayerData] = Field(default_factory=lambda: [PlaceLayerData(name="Default")], max_length=64)
+    walk_speed: FiniteFloat = Field(default=8.5, ge=1, le=40)
+    jump_force: FiniteFloat = Field(default=13.5, ge=1, le=80)
+    gravity: FiniteFloat = Field(default=32, ge=1, le=100)
+    sprint_enabled: bool = True
+    wall_jump_enabled: bool = True
+    baseplate_enabled: bool = True
+    death_height: FiniteFloat = Field(default=-20, ge=-1000, le=-1)
 
 # Routes
 @app.get("/")
@@ -235,7 +247,15 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
         "updated_at": now_str,
         "spawn": place.spawn,
         "blocks": [b.model_dump() for b in place.blocks],
-        "thumbnail_png": place.thumbnail_png
+        "thumbnail_png": place.thumbnail_png,
+        "layers": [layer.model_dump() for layer in place.layers],
+        "walk_speed": place.walk_speed,
+        "jump_force": place.jump_force,
+        "gravity": place.gravity,
+        "sprint_enabled": place.sprint_enabled,
+        "wall_jump_enabled": place.wall_jump_enabled,
+        "baseplate_enabled": place.baseplate_enabled,
+        "death_height": place.death_height
     }
     
     write_json_file(place_key, place_record)
