@@ -2,7 +2,11 @@ import os
 import json
 import uuid
 import time
+import math
+import re
 import datetime
+import threading
+from functools import wraps
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Header, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -67,6 +71,14 @@ if R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY:
 
 LOCAL_STORAGE_DIR = "storage"
 os.makedirs(LOCAL_STORAGE_DIR, exist_ok=True)
+storage_lock = threading.RLock()
+
+def storage_locked(function):
+    @wraps(function)
+    def wrapped(*args, **kwargs):
+        with storage_lock:
+            return function(*args, **kwargs)
+    return wrapped
 
 def write_json_file(path_key: str, data: dict):
     payload = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
@@ -137,6 +149,12 @@ class AuthResponse(BaseModel):
     username: str
     token: str
 
+class EventRequest(BaseModel):
+    event_id: str = Field(..., min_length=32, max_length=36, pattern=r"^[a-fA-F0-9-]{32,36}$")
+
+class FriendRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=24, pattern=r"^[A-Za-z0-9_]+$")
+
 class PlaceBlock(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -160,6 +178,7 @@ class PlaceData(BaseModel):
     author: Optional[str] = ""
     spawn: List[FiniteFloat] = Field(default_factory=lambda: [0, 2, 0], min_length=3, max_length=3)
     blocks: List[PlaceBlock] = Field(default_factory=list, max_length=4000)
+    gui_elements: Optional[List[dict]] = Field(default=None, max_length=32)
     thumbnail_png: Optional[str] = Field(default=None, max_length=1_400_000)
     layers: List[PlaceLayerData] = Field(default_factory=lambda: [PlaceLayerData(name="Default")], max_length=64)
     walk_speed: FiniteFloat = Field(default=8.5, ge=1, le=40)
@@ -169,6 +188,43 @@ class PlaceData(BaseModel):
     wall_jump_enabled: bool = True
     baseplate_enabled: bool = True
     death_height: FiniteFloat = Field(default=-20, ge=-1000, le=-1)
+
+
+def validate_gui_elements(raw: Any) -> Optional[List[dict]]:
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or len(raw) > 32:
+        raise HTTPException(status_code=400, detail="Некоректний список елементів інтерфейсу плейса")
+
+    result = []
+    ids = set()
+    for element in raw:
+        if not isinstance(element, dict):
+            raise HTTPException(status_code=400, detail="Некоректний елемент інтерфейсу")
+        element_id = element.get("Id", element.get("id", ""))
+        element_type = element.get("Type", element.get("type", "label"))
+        text = element.get("Text", element.get("text", ""))
+        script = element.get("OnClickScript", element.get("onClickScript", ""))
+        if (not isinstance(element_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", element_id) or
+            element_id in ids or element_type not in ("label", "button") or
+            not isinstance(text, str) or len(text) > 200 or
+            not isinstance(script, str) or len(script) > 1000):
+            raise HTTPException(status_code=400, detail="Некоректні властивості елемента інтерфейсу")
+
+        clean = {"Id": element_id, "Type": element_type, "Text": text, "OnClickScript": script}
+        for key, lower, upper, default in (
+            ("X", 0, 100, 50), ("Y", 0, 100, 50),
+            ("Width", 1, 100, 24), ("Height", 1, 100, 7),
+        ):
+            value = element.get(key, element.get(key.lower(), default))
+            if (not isinstance(value, (int, float)) or isinstance(value, bool) or
+                not math.isfinite(float(value)) or not lower <= value <= upper):
+                raise HTTPException(status_code=400, detail="Некоректний розмір або позиція елемента інтерфейсу")
+            clean[key] = float(value)
+        ids.add(element_id)
+        result.append(clean)
+    return result
+
 
 # Routes
 @app.get("/")
@@ -225,6 +281,7 @@ def me(current_user: str = Depends(get_current_user)):
     return {"status": "ok", "username": current_user}
 
 @app.post("/api/places/save")
+@storage_locked
 def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
     # Server-side validation against malicious / oversized payloads
     if len(place.blocks) > 4000:
@@ -236,8 +293,14 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
     existing = read_json_file(place_key)
     if existing and existing.get("author") != current_user:
         raise HTTPException(status_code=403, detail="Ви не є автором цього плейса")
+    gui_elements = validate_gui_elements(place.gui_elements)
+    if gui_elements is None:
+        gui_elements = existing.get("gui_elements", [])
     
     now_str = datetime.datetime.utcnow().isoformat()
+    liked_by = (existing or {}).get("liked_by", (existing or {}).get("likes", []))
+    if not isinstance(liked_by, list):
+        liked_by = []
     place_record = {
         "id": place_id,
         "title": place.title,
@@ -247,6 +310,7 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
         "updated_at": now_str,
         "spawn": place.spawn,
         "blocks": [b.model_dump() for b in place.blocks],
+        "gui_elements": gui_elements,
         "thumbnail_png": place.thumbnail_png,
         "layers": [layer.model_dump() for layer in place.layers],
         "walk_speed": place.walk_speed,
@@ -255,8 +319,11 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
         "sprint_enabled": place.sprint_enabled,
         "wall_jump_enabled": place.wall_jump_enabled,
         "baseplate_enabled": place.baseplate_enabled,
-        "death_height": place.death_height
+        "death_height": place.death_height,
+        "plays": int((existing or {}).get("plays", 0)),
+        "liked_by": list(liked_by)
     }
+    place_record["likes"] = len(place_record["liked_by"])
     
     write_json_file(place_key, place_record)
     
@@ -268,6 +335,8 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
         "author": current_user,
         "block_count": len(place.blocks),
         "has_thumbnail": bool(place.thumbnail_png),
+        "plays": place_record["plays"],
+        "likes": place_record["likes"],
         "updated_at": now_str
     })
     index_data["places"] = places_list[:100]
@@ -276,17 +345,180 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
     return {"status": "success", "id": place_id, "message": "Плейс збережено в Cloudflare R2"}
 
 @app.get("/api/places/list")
-def list_places():
+def list_places(authorization: Optional[str] = Header(None)):
     index_data = read_json_file("places_index.json") or {"places": []}
-    return index_data
+    username = None
+    if authorization:
+        try:
+            username = jwt.decode(authorization.replace("Bearer ", "").strip(), JWT_SECRET, algorithms=[JWT_ALGORITHM]).get("sub")
+        except jwt.PyJWTError:
+            pass
+    places = []
+    for item in index_data.get("places", []):
+        result = dict(item)
+        result.setdefault("plays", 0)
+        result.setdefault("likes", 0)
+        if username:
+            place = read_json_file(f"places/{result.get('id', '')}.json") or {}
+            liked_by = place.get("liked_by", place.get("likes", []))
+            result["liked_by_me"] = isinstance(liked_by, list) and username in liked_by
+        places.append(result)
+    return {"places": places}
+
+def _stats_key(username: str) -> str:
+    return f"stats/{username}.json"
+
+def _get_stats(username: str) -> dict:
+    return read_json_file(_stats_key(username)) or {"deaths": 0, "places_played": 0, "death_events": []}
+
+@app.get("/api/stats/me")
+def get_my_stats(current_user: str = Depends(get_current_user)):
+    stats = _get_stats(current_user)
+    return {"deaths": int(stats.get("deaths", 0)), "places_played": int(stats.get("places_played", 0))}
+
+@app.post("/api/stats/death")
+def record_death(req: EventRequest, current_user: str = Depends(get_current_user)):
+    with storage_lock:
+        stats = _get_stats(current_user)
+        event_ids = stats.get("death_events", [])
+        if not isinstance(event_ids, list):
+            event_ids = []
+        if req.event_id not in event_ids:
+            event_ids.append(req.event_id)
+            stats["death_events"] = event_ids[-4096:]
+            stats["deaths"] = int(stats.get("deaths", 0)) + 1
+            write_json_file(_stats_key(current_user), stats)
+        return {"deaths": int(stats.get("deaths", 0)), "recorded": req.event_id in event_ids}
+
+@app.post("/api/places/{place_id}/play")
+def record_place_play(place_id: str, current_user: str = Depends(get_current_user)):
+    if not re.fullmatch(r"[a-fA-F0-9-]{1,36}", place_id):
+        raise HTTPException(status_code=404, detail="Плейс не знайдено")
+    with storage_lock:
+        record = read_json_file(f"places/{place_id}.json")
+        if not record:
+            raise HTTPException(status_code=404, detail="Плейс не знайдено")
+        record["plays"] = int(record.get("plays", 0)) + 1
+        write_json_file(f"places/{place_id}.json", record)
+        stats = _get_stats(current_user)
+        stats["places_played"] = int(stats.get("places_played", 0)) + 1
+        write_json_file(_stats_key(current_user), stats)
+        index_data = read_json_file("places_index.json") or {"places": []}
+        for item in index_data.get("places", []):
+            if item.get("id") == place_id:
+                item["plays"] = record["plays"]
+                break
+        write_json_file("places_index.json", index_data)
+        return {"plays": record["plays"]}
+
+@app.post("/api/places/{place_id}/like")
+def toggle_place_like(place_id: str, current_user: str = Depends(get_current_user)):
+    if not re.fullmatch(r"[a-fA-F0-9-]{1,36}", place_id):
+        raise HTTPException(status_code=404, detail="Плейс не знайдено")
+    with storage_lock:
+        record = read_json_file(f"places/{place_id}.json")
+        if not record:
+            raise HTTPException(status_code=404, detail="Плейс не знайдено")
+        likes = record.get("liked_by", record.get("likes", []))
+        if not isinstance(likes, list):
+            likes = []
+        liked = current_user not in likes
+        if liked:
+            likes.append(current_user)
+        else:
+            likes.remove(current_user)
+        record["liked_by"] = likes
+        record["likes"] = len(likes)
+        write_json_file(f"places/{place_id}.json", record)
+        index_data = read_json_file("places_index.json") or {"places": []}
+        for item in index_data.get("places", []):
+            if item.get("id") == place_id:
+                item["likes"] = record["likes"]
+                break
+        write_json_file("places_index.json", index_data)
+        return {"liked": liked, "likes": len(likes)}
+
+def _get_user_record(username: str) -> dict:
+    user = read_json_file(f"users/{username}.json")
+    if not user:
+        raise HTTPException(status_code=404, detail="Користувача не знайдено")
+    user.setdefault("friends", [])
+    user.setdefault("incoming_requests", [])
+    return user
+
+@app.get("/api/friends")
+def get_friends(current_user: str = Depends(get_current_user)):
+    user = _get_user_record(current_user)
+    return {"friends": user["friends"], "incoming_requests": user["incoming_requests"]}
+
+@app.post("/api/friends/request")
+def request_friend(req: FriendRequest, current_user: str = Depends(get_current_user)):
+    target_name = req.username.strip().lower()
+    if target_name == current_user.lower():
+        raise HTTPException(status_code=400, detail="Не можна додати себе в друзі")
+    with storage_lock:
+        sender = _get_user_record(current_user)
+        target = _get_user_record(target_name)
+        if target_name in sender["friends"]:
+            raise HTTPException(status_code=409, detail="Цей користувач уже у друзях")
+        if current_user in target["incoming_requests"]:
+            return {"status": "already_requested"}
+        if target_name in sender["incoming_requests"]:
+            raise HTTPException(status_code=409, detail="Прийміть вхідний запит від цього користувача")
+        if len(target["incoming_requests"]) >= 100:
+            raise HTTPException(status_code=429, detail="У користувача забагато запитів")
+        target["incoming_requests"].append(current_user)
+        write_json_file(f"users/{target_name}.json", target)
+        return {"status": "requested"}
+
+@app.post("/api/friends/accept")
+def accept_friend(req: FriendRequest, current_user: str = Depends(get_current_user)):
+    other_name = req.username.strip().lower()
+    if other_name == current_user.lower():
+        raise HTTPException(status_code=400, detail="Не можна додати себе в друзі")
+    with storage_lock:
+        user = _get_user_record(current_user)
+        other = _get_user_record(other_name)
+        if other_name not in user["incoming_requests"]:
+            raise HTTPException(status_code=404, detail="Запит у друзі не знайдено")
+        user["incoming_requests"].remove(other_name)
+        if other_name not in user["friends"]:
+            user["friends"].append(other_name)
+        if current_user not in other["friends"]:
+            other["friends"].append(current_user)
+        other["incoming_requests"] = [name for name in other["incoming_requests"] if name != current_user]
+        write_json_file(f"users/{current_user}.json", user)
+        write_json_file(f"users/{other_name}.json", other)
+        return {"status": "accepted"}
+
+@app.post("/api/friends/remove")
+def remove_friend(req: FriendRequest, current_user: str = Depends(get_current_user)):
+    other_name = req.username.strip().lower()
+    if other_name == current_user.lower():
+        raise HTTPException(status_code=400, detail="Не можна видалити себе з друзів")
+    with storage_lock:
+        user = _get_user_record(current_user)
+        other = _get_user_record(other_name)
+        user["friends"] = [name for name in user["friends"] if name != other_name]
+        other["friends"] = [name for name in other["friends"] if name != current_user]
+        user["incoming_requests"] = [name for name in user["incoming_requests"] if name != other_name]
+        other["incoming_requests"] = [name for name in other["incoming_requests"] if name != current_user]
+        write_json_file(f"users/{current_user}.json", user)
+        write_json_file(f"users/{other_name}.json", other)
+        return {"status": "removed"}
 
 @app.get("/api/places/{place_id}")
 def get_place(place_id: str):
+    if not re.fullmatch(r"[a-fA-F0-9-]{1,36}", place_id):
+        raise HTTPException(status_code=404, detail="Плейс не знайдено")
     place_key = f"places/{place_id}.json"
     place_record = read_json_file(place_key)
     if not place_record:
         raise HTTPException(status_code=404, detail="Плейс не знайдено")
-    return place_record
+    result = dict(place_record)
+    liked_by = result.pop("liked_by", result.get("likes", []))
+    result["likes"] = len(liked_by) if isinstance(liked_by, list) else int(result.get("likes", 0))
+    return result
 
 @app.get("/api/places/{place_id}/thumbnail")
 def get_place_thumbnail(place_id: str):
