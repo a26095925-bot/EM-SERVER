@@ -25,7 +25,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "")
 if len(JWT_SECRET.encode("utf-8")) < 32:
     raise RuntimeError("JWT_SECRET must be configured with at least 32 bytes of random data")
 JWT_ALGORITHM = "HS256"
-OWNER_USERNAMES = {name.strip().lower() for name in os.getenv("OWNER_USERNAMES", "mrkotik,arsen2014a").split(",") if name.strip()}
+OWNER_USERNAMES = {name.strip().lower() for name in os.getenv("OWNER_USERNAMES", "mrkotik").split(",") if name.strip()}
 ADMIN_USERNAMES = {name.strip().lower() for name in os.getenv("ADMIN_USERNAMES", "").split(",") if name.strip()}
 PLACE_VISITS: Dict[str, int] = {}
 
@@ -205,13 +205,21 @@ class AuthResponse(BaseModel):
     token: str
 
 class PlaceBlock(BaseModel):
-    type: str = Field(..., pattern="^(solid|spawn|checkpoint|lava|trampoline|speedpad|damage|light|door)$")
+    name: Optional[str] = "Part"
+    type: str = Field(..., pattern="^(solid|spawn|checkpoint|lava|trampoline|speedpad|damage|light|door|ice|sticky|conveyor|forcefield|antigravity|boost|invisible)$")
+    shape: Optional[str] = Field(default="cube", pattern="^(cube|cylinder|wedge|sphere|pyramid|prism|arch|trussbeam|cornerwedge|torus|star)$")
     pos: List[float]
     size: List[float]
     color: str
     power: Optional[float] = Field(default=10.0, ge=0, le=100)
     damage_interval: Optional[float] = Field(default=1.0, ge=0.1, le=10.0)
+    anchored: Optional[bool] = True
+    cancollide: Optional[bool] = True
+    model_path: Optional[str] = None
+    texture_path: Optional[str] = None
+    rot: Optional[List[float]] = Field(default_factory=lambda: [0.0, 0.0, 0.0])
     script: Optional[str] = None
+    group_id: Optional[str] = None
 
     @field_validator("pos", "size")
     @classmethod
@@ -420,7 +428,7 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
         "created_at": existing.get("created_at") if existing else now_str,
         "updated_at": now_str,
         "spawn": place.spawn,
-        "blocks": [b.dict() for b in place.blocks],
+        "blocks": [b.dict(exclude_none=True) for b in place.blocks],
         "thumbnail_png": place.thumbnail_png
     }
     
@@ -709,7 +717,7 @@ async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
                     await websocket.send_json({"type": "notice", "message": "Ваш чат тимчасово вимкнено модератором."})
                     continue
                 last_chat_at = now
-                await multiplayer_rooms.broadcast(room, {"type": "chat", "username": username, "message": text}, exclude=websocket)
+                await multiplayer_rooms.broadcast(room, {"type": "chat", "username": username, "is_owner": is_owner(username), "message": text}, exclude=websocket)
                 continue
             if message.get("type") != "state":
                 continue
@@ -729,23 +737,26 @@ async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
                 head_scale = max(1.0, min(3.0, head_scale))
             except (TypeError, ValueError):
                 head_scale = 1.0
-            if not isinstance(skin, dict) or len(json.dumps(skin, ensure_ascii=False)) > 4096:
-                skin = {}
-            else:
-                allowed_skin_fields = {"headColorHex", "torsoColorHex", "leftArmColorHex", "rightArmColorHex",
-                                       "leftLegColorHex", "rightLegColorHex", "hat", "face", "faceAsset"}
-                skin = {key: value for key, value in skin.items() if key in allowed_skin_fields}
+            skin_dict = {}
+            if isinstance(skin, dict) and len(json.dumps(skin, ensure_ascii=False)) <= 8192:
+                for k, v in skin.items():
+                    norm_k = k[:1].lower() + k[1:] if k else ""
+                    if norm_k in {"headColorHex", "torsoColorHex", "leftArmColorHex", "rightArmColorHex",
+                                  "leftLegColorHex", "rightLegColorHex", "hat", "face", "faceAsset"}:
+                        skin_dict[norm_k] = v
                 for color_key in ("headColorHex", "torsoColorHex", "leftArmColorHex", "rightArmColorHex", "leftLegColorHex", "rightLegColorHex"):
-                    if not isinstance(skin.get(color_key), str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", skin[color_key]):
-                        skin.pop(color_key, None)
-                if not isinstance(skin.get("faceAsset", ""), str) or (skin.get("faceAsset") and not re.fullmatch(r"CLASSIC_FACES/[^/\\]{1,180}\.png", skin["faceAsset"])):
-                    skin.pop("faceAsset", None)
+                    if not isinstance(skin_dict.get(color_key), str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", skin_dict[color_key]):
+                        skin_dict.pop(color_key, None)
+                if not isinstance(skin_dict.get("faceAsset", ""), str) or (skin_dict.get("faceAsset") and not re.fullmatch(r"CLASSIC_FACES/[^/\\]{1,180}\.png", skin_dict["faceAsset"])):
+                    skin_dict.pop("faceAsset", None)
+            is_user_owner = is_owner(username)
             await multiplayer_rooms.broadcast(room, {
                 "type": "state", "username": username,
+                "is_owner": is_user_owner,
                 "position": coords,
                 "yaw": float(message.get("yaw", 0.0)) % 360.0,
                 "head_scale": head_scale,
-                "skin": skin
+                "skin": skin_dict
             }, exclude=websocket)
     except WebSocketDisconnect:
         pass
