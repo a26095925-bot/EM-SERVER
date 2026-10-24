@@ -5,10 +5,12 @@ import time
 import math
 import re
 import datetime
+import asyncio
 import threading
+from collections import defaultdict, deque
 from functools import wraps
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, Header, Depends, Request, status
+from fastapi import FastAPI, HTTPException, Header, Depends, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
 import bcrypt
@@ -32,6 +34,91 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+class LivePlaceRoom:
+    def __init__(self, owner: str, blocks: List[dict], gui_elements: List[dict]):
+        self.owner = owner
+        self.blocks = {block["id"]: block for block in blocks}
+        self.gui_elements = gui_elements
+        self.clients: Dict[WebSocket, str] = {}
+        self.rate_windows: Dict[tuple, deque] = defaultdict(deque)
+
+
+live_rooms: Dict[str, LivePlaceRoom] = {}
+live_rooms_lock = asyncio.Lock()
+
+
+def _bounded_number(value: Any, lower: float, upper: float) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(float(value)) and lower <= value <= upper)
+
+
+def _safe_live_block(raw: Any) -> Optional[dict]:
+    if not isinstance(raw, dict):
+        return None
+    block = dict(raw)
+    block_id = block.get("id")
+    if not isinstance(block_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", block_id):
+        return None
+    if len(json.dumps(block, separators=(",", ":"), ensure_ascii=False).encode("utf-8")) > 16_000:
+        return None
+    for key, default in (("pos", [0, 0, 0]), ("size", [1, 1, 1]), ("rot", [0, 0, 0])):
+        values = block.get(key, default)
+        if (not isinstance(values, list) or len(values) != 3 or
+                any(not _bounded_number(value, 0.000001 if key == "size" else -10000,
+                                        512 if key == "size" else 10000) for value in values)):
+            return None
+        block[key] = [float(value) for value in values]
+    color = block.get("color", "#3B82F6")
+    if not isinstance(color, str) or not re.fullmatch(r"#[0-9A-Fa-f]{6}", color):
+        return None
+    return block
+
+
+def _safe_live_gui_elements(raw: Any) -> Optional[List[dict]]:
+    try:
+        return validate_gui_elements(raw)
+    except (HTTPException, TypeError, ValueError):
+        return None
+
+
+def _allow_live_message(room: LivePlaceRoom, websocket: WebSocket, kind: str) -> bool:
+    now = time.monotonic()
+    window = room.rate_windows[(websocket, kind)]
+    limit = {"state": 15, "chat": 5, "block_upsert": 20, "block_remove": 20, "place_state": 4}.get(kind, 0)
+    while window and now - window[0] >= 1:
+        window.popleft()
+    if len(window) >= limit:
+        return False
+    window.append(now)
+    return True
+
+
+async def _send_block_snapshot(websocket: WebSocket, blocks: List[dict]):
+    await websocket.send_json({"type": "block_snapshot_start"})
+    chunk: List[dict] = []
+    for block in blocks:
+        candidate = chunk + [block]
+        if chunk and len(json.dumps(candidate, separators=(",", ":")).encode("utf-8")) > 48_000:
+            await websocket.send_json({"type": "block_snapshot_chunk", "blocks": chunk})
+            chunk = [block]
+        else:
+            chunk = candidate
+    if chunk:
+        await websocket.send_json({"type": "block_snapshot_chunk", "blocks": chunk})
+    await websocket.send_json({"type": "block_snapshot_end"})
+
+
+async def _broadcast_live(room: LivePlaceRoom, payload: dict):
+    disconnected = []
+    for connection in list(room.clients):
+        try:
+            await connection.send_json(payload)
+        except Exception:
+            disconnected.append(connection)
+    for connection in disconnected:
+        room.clients.pop(connection, None)
+
 
 # In-memory Rate Limiting / Bot Protection
 RATE_LIMIT_STORE: Dict[str, List[float]] = {}
@@ -229,14 +316,141 @@ def validate_gui_elements(raw: Any) -> Optional[List[dict]]:
 # Routes
 @app.get("/")
 def root():
+    websocket_route = any(getattr(route, "path", None) == "/ws/{place_id}" for route in app.routes)
     return {
         "status": "online",
         "service": "Roblox-Style Game API with Stats, Friends, Likes, and Multiplayer",
         "api_version": app.version,
-        "features": ["stats", "friends", "place_likes", "place_plays", "multiplayer"],
+        "features": ["stats", "friends", "place_likes", "place_plays"] + (["multiplayer"] if websocket_route else []),
+        "multiplayer_websocket": websocket_route,
+        "websocket_path": "/ws/{place_id}" if websocket_route else None,
         "storage": "Cloudflare R2" if s3_client else "Local Cache",
         "time": datetime.datetime.utcnow().isoformat()
     }
+
+
+@app.websocket("/ws/{place_id}")
+async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
+    if not re.fullmatch(r"[a-fA-F0-9-]{1,36}", place_id):
+        await websocket.close(code=4404)
+        return
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        username = payload.get("sub")
+        if not username:
+            raise jwt.InvalidTokenError("Missing subject")
+    except jwt.PyJWTError:
+        await websocket.close(code=4401)
+        return
+
+    place_record = read_json_file(f"places/{place_id}.json")
+    if not place_record:
+        await websocket.close(code=4404)
+        return
+    owner = place_record.get("author", "")
+    if not isinstance(owner, str) or not owner:
+        await websocket.close(code=4403)
+        return
+
+    async with live_rooms_lock:
+        room = live_rooms.get(place_id)
+        if room is None or room.owner.lower() != owner.lower():
+            blocks = []
+            stored_blocks = place_record.get("blocks", [])
+            if isinstance(stored_blocks, list):
+                for raw_block in stored_blocks[:4000]:
+                    if isinstance(raw_block, dict):
+                        block = dict(raw_block)
+                        block.setdefault("id", uuid.uuid4().hex)
+                        clean = _safe_live_block(block)
+                        if clean:
+                            blocks.append(clean)
+            gui_elements = _safe_live_gui_elements(place_record.get("gui_elements", [])) or []
+            room = LivePlaceRoom(owner, blocks, gui_elements)
+            live_rooms[place_id] = room
+
+    await websocket.accept()
+    room.clients[websocket] = username
+    await websocket.send_json({"type": "welcome", "username": username, "is_owner": username.lower() == owner.lower()})
+    await websocket.send_json({"type": "roster", "players": list(room.clients.values())})
+    await _send_block_snapshot(websocket, list(room.blocks.values()))
+    await websocket.send_json({"type": "place_state", "gui_elements": room.gui_elements})
+    await _broadcast_live(room, {"type": "joined", "username": username})
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            if len(raw.encode("utf-8")) > 65_536:
+                await websocket.close(code=1009, reason="Message too large")
+                break
+            try:
+                message = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(message, dict):
+                continue
+            kind = message.get("type")
+            if kind not in ("state", "chat", "block_upsert", "block_remove", "place_state"):
+                continue
+            if not _allow_live_message(room, websocket, kind):
+                continue
+
+            is_owner = username.lower() == room.owner.lower()
+            if kind == "state":
+                position = message.get("position")
+                yaw = message.get("yaw", 0)
+                scale = message.get("head_scale", 1)
+                if (not isinstance(position, list) or len(position) != 3 or
+                        any(not _bounded_number(value, -100000, 100000) for value in position) or
+                        not _bounded_number(yaw, -36000, 36000) or not _bounded_number(scale, 1, 3)):
+                    continue
+                skin = message.get("skin", {})
+                if not isinstance(skin, dict):
+                    skin = {}
+                skin = {key: value[:80] for key, value in skin.items()
+                        if isinstance(key, str) and isinstance(value, str) and len(value) <= 80}
+                await _broadcast_live(room, {
+                    "type": "state", "username": username, "is_owner": is_owner,
+                    "position": [float(value) for value in position],
+                    "yaw": float(yaw), "head_scale": float(scale), "skin": skin,
+                })
+            elif kind == "chat":
+                text = message.get("message")
+                if not isinstance(text, str):
+                    continue
+                text = "".join(character for character in text if character.isprintable()).strip()[:220]
+                if text:
+                    await _broadcast_live(room, {
+                        "type": "chat", "username": username,
+                        "is_owner": is_owner, "message": text,
+                    })
+            elif not is_owner:
+                await websocket.send_json({"type": "notice", "message": "Тільки автор плейса може змінювати блоки та скрипти."})
+            elif kind == "block_upsert":
+                block = _safe_live_block(message.get("block"))
+                if not block or (block["id"] not in room.blocks and len(room.blocks) >= 4000):
+                    continue
+                room.blocks[block["id"]] = block
+                await _broadcast_live(room, {"type": "block_upsert", "block": block})
+            elif kind == "block_remove":
+                block_id = message.get("id")
+                if isinstance(block_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", block_id):
+                    if room.blocks.pop(block_id, None) is not None:
+                        await _broadcast_live(room, {"type": "block_remove", "id": block_id})
+            else:
+                gui_elements = _safe_live_gui_elements(message.get("gui_elements"))
+                if gui_elements is not None:
+                    room.gui_elements = gui_elements
+                    await _broadcast_live(room, {"type": "place_state", "gui_elements": gui_elements})
+    except WebSocketDisconnect:
+        pass
+    finally:
+        room.clients.pop(websocket, None)
+        room.rate_windows = defaultdict(deque, {
+            key: stamps for key, stamps in room.rate_windows.items() if key[0] is not websocket
+        })
+        await _broadcast_live(room, {"type": "left", "username": username})
+
 
 @app.post("/api/auth/register", response_model=AuthResponse)
 def register(req: AuthRequest, request: Request):
