@@ -331,8 +331,9 @@ def root():
 
 @app.websocket("/ws/{place_id}")
 async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
+    await websocket.accept()
     if not re.fullmatch(r"[a-fA-F0-9-]{1,36}", place_id):
-        await websocket.close(code=4404)
+        await websocket.close(code=4404, reason="Invalid place ID")
         return
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
@@ -340,16 +341,16 @@ async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
         if not username:
             raise jwt.InvalidTokenError("Missing subject")
     except jwt.PyJWTError:
-        await websocket.close(code=4401)
+        await websocket.close(code=4401, reason="Session is invalid or expired; sign in again")
         return
 
     place_record = read_json_file(f"places/{place_id}.json")
     if not place_record:
-        await websocket.close(code=4404)
+        await websocket.close(code=4404, reason="Place not found; check the place ID")
         return
     owner = place_record.get("author", "")
     if not isinstance(owner, str) or not owner:
-        await websocket.close(code=4403)
+        await websocket.close(code=4403, reason="Place has no valid owner")
         return
 
     async with live_rooms_lock:
@@ -369,7 +370,6 @@ async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
             room = LivePlaceRoom(owner, blocks, gui_elements)
             live_rooms[place_id] = room
 
-    await websocket.accept()
     room.clients[websocket] = username
     await websocket.send_json({"type": "welcome", "username": username, "is_owner": username.lower() == owner.lower()})
     await websocket.send_json({"type": "roster", "players": list(room.clients.values())})
