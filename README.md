@@ -8,6 +8,8 @@
 uvicorn server:app --host 0.0.0.0 --port $PORT
 ```
 
+Файл `.python-version` фіксує Python 3.12: нові версії Pydantic у зафіксованих залежностях можуть не мати готового `pydantic-core` для Python 3.14, через що Render намагається зібрати Rust-пакет у середовищі без доступного Cargo cache.
+
 Після деплою відкрийте кореневу адресу сервісу. У JSON мають бути `"status":"online"` і `"multiplayer_websocket":true`. Це підтверджує, що Render запустив саме версію з маршрутом мультиплеєра. Якщо поле відсутнє або дорівнює `false`, перевірте вибраний GitHub-репозиторій, гілку `main`, останній успішний deploy і що Root Directory порожній.
 
 ### Перевірка WebSocket
