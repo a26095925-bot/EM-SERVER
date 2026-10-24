@@ -6,7 +6,7 @@ import datetime
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, Header, Depends, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
 import bcrypt
 import jwt
 import uvicorn
@@ -138,20 +138,25 @@ class AuthResponse(BaseModel):
     token: str
 
 class PlaceBlock(BaseModel):
-    type: str
-    pos: List[float]
-    size: List[float]
-    color: str
-    power: Optional[float] = 10.0
-    script: Optional[str] = None
+    model_config = ConfigDict(extra="allow")
+
+    type: str = "solid"
+    pos: List[FiniteFloat] = Field(default_factory=lambda: [0, 0, 0], min_length=3, max_length=3)
+    size: List[FiniteFloat] = Field(default_factory=lambda: [1, 1, 1], min_length=3, max_length=3)
+    color: str = "#3B82F6"
+    power: Optional[FiniteFloat] = Field(default=10.0, ge=0, le=100)
+    script: Optional[str] = Field(default=None, max_length=4000)
 
 class PlaceData(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     id: Optional[str] = None
     title: str = Field(..., min_length=1, max_length=60)
     description: Optional[str] = ""
     author: Optional[str] = ""
-    spawn: Optional[List[float]] = [0, 2, 0]
-    blocks: List[PlaceBlock] = []
+    spawn: List[FiniteFloat] = Field(default_factory=lambda: [0, 2, 0], min_length=3, max_length=3)
+    blocks: List[PlaceBlock] = Field(default_factory=list, max_length=4000)
+    thumbnail_png: Optional[str] = Field(default=None, max_length=1_400_000)
 
 # Routes
 @app.get("/")
@@ -210,8 +215,8 @@ def me(current_user: str = Depends(get_current_user)):
 @app.post("/api/places/save")
 def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
     # Server-side validation against malicious / oversized payloads
-    if len(place.blocks) > 10000:
-        raise HTTPException(status_code=400, detail="Перевищено ліміт: максимум 10 000 блоків на один плейс")
+    if len(place.blocks) > 4000:
+        raise HTTPException(status_code=400, detail="Перевищено ліміт: максимум 4 000 блоків на один плейс")
 
     place_id = place.id or str(uuid.uuid4())[:8]
     place_key = f"places/{place_id}.json"
@@ -229,7 +234,8 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
         "created_at": existing.get("created_at") if existing else now_str,
         "updated_at": now_str,
         "spawn": place.spawn,
-        "blocks": [b.dict() for b in place.blocks]
+        "blocks": [b.model_dump() for b in place.blocks],
+        "thumbnail_png": place.thumbnail_png
     }
     
     write_json_file(place_key, place_record)
@@ -241,6 +247,7 @@ def save_place(place: PlaceData, current_user: str = Depends(get_current_user)):
         "title": place.title,
         "author": current_user,
         "block_count": len(place.blocks),
+        "has_thumbnail": bool(place.thumbnail_png),
         "updated_at": now_str
     })
     index_data["places"] = places_list[:100]
@@ -260,6 +267,21 @@ def get_place(place_id: str):
     if not place_record:
         raise HTTPException(status_code=404, detail="Плейс не знайдено")
     return place_record
+
+@app.get("/api/places/{place_id}/thumbnail")
+def get_place_thumbnail(place_id: str):
+    place_record = read_json_file(f"places/{place_id}.json")
+    if not place_record or not place_record.get("thumbnail_png"):
+        raise HTTPException(status_code=404, detail="Обкладинку плейса не знайдено")
+    try:
+        import base64
+        image = base64.b64decode(place_record["thumbnail_png"], validate=True)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=422, detail="Некоректний формат обкладинки")
+    if len(image) > 1_000_000 or not image.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise HTTPException(status_code=422, detail="Некоректний PNG-файл")
+    from fastapi.responses import Response
+    return Response(content=image, media_type="image/png")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
