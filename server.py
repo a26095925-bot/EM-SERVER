@@ -23,7 +23,7 @@ R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
 JWT_SECRET = os.getenv("JWT_SECRET", "super_secret_roblox_style_jwt_key_2026")
 JWT_ALGORITHM = "HS256"
 
-app = FastAPI(title="Roblox-Style Game Backend", version="1.1.0")
+app = FastAPI(title="Roblox-Style Game Backend", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -231,7 +231,9 @@ def validate_gui_elements(raw: Any) -> Optional[List[dict]]:
 def root():
     return {
         "status": "online",
-        "service": "Roblox-Style Game API with Anti-Cheat & Bot Protection",
+        "service": "Roblox-Style Game API with Stats, Friends, Likes, and Multiplayer",
+        "api_version": app.version,
+        "features": ["stats", "friends", "place_likes", "place_plays", "multiplayer"],
         "storage": "Cloudflare R2" if s3_client else "Local Cache",
         "time": datetime.datetime.utcnow().isoformat()
     }
