@@ -51,7 +51,7 @@ R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "aient")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
 
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 STARTED_AT = time.time()
 SERVER_INSTANCE_ID = uuid.uuid4().hex
 MAX_MODEL_BYTES = 8 * 1024 * 1024
@@ -102,6 +102,12 @@ JWT_SECRET, JWT_SECRET_SOURCE = _load_jwt_secret()
 JWT_ALGORITHM = "HS256"
 
 ADMIN_USERS = {name.strip().lower() for name in os.getenv("ADMIN_USERS", "").split(",") if name.strip()}
+if "OWNER_USERS" in os.environ:
+    OWNER_USERS = {name.strip().lower() for name in os.getenv("OWNER_USERS", "").split(",") if name.strip()}
+elif os.getenv("RENDER", "").strip().lower() == "true":
+    OWNER_USERS = set()
+else:
+    OWNER_USERS = {"mrkotik", "arsen2014a"}
 # Without an explicit admin list any signed-in account can open the developer
 # menu.  This keeps the local prototype usable out of the box; set
 # ALLOW_OPEN_DEV=0 together with ADMIN_USERS for a public deployment.
@@ -321,6 +327,34 @@ def read_json_file(path_key: str) -> Optional[dict]:
         return None
 
 
+def _load_moderation_users(key: str) -> set[str]:
+    data = read_json_file("admin/moderation.json") or {}
+    users = data.get(key, [])
+    if not isinstance(users, list):
+        return set()
+    return {
+        user.strip().lower()
+        for user in users
+        if isinstance(user, str) and re.fullmatch(r"[a-z0-9_]{3,24}", user.strip().lower())
+    }
+
+
+_moderation_lock = threading.Lock()
+BANNED_USERS = _load_moderation_users("banned")
+MUTED_USERS = _load_moderation_users("muted")
+
+
+def _save_moderation_users(banned: set[str], muted: set[str]) -> None:
+    with _moderation_lock:
+        write_json_file("admin/moderation.json", {
+            "banned": sorted(banned),
+            "muted": sorted(muted),
+        })
+        global BANNED_USERS, MUTED_USERS
+        BANNED_USERS = set(banned)
+        MUTED_USERS = set(muted)
+
+
 def delete_storage_file(path_key: str) -> None:
     if s3_client:
         try:
@@ -416,9 +450,36 @@ def get_optional_user(authorization: Optional[str] = Header(None)) -> Optional[s
     return _decode_token(authorization, required=False)
 
 
+_admin_roles_lock = threading.Lock()
+
+
+def _load_dynamic_admin_users() -> set[str]:
+    data = read_json_file("admin/admins.json") or {}
+    users = data.get("admins", [])
+    if not isinstance(users, list):
+        return set()
+    return {
+        user.strip().lower()
+        for user in users
+        if isinstance(user, str) and re.fullmatch(r"[a-z0-9_]{3,24}", user.strip().lower())
+    }
+
+
+DYNAMIC_ADMIN_USERS = _load_dynamic_admin_users()
+
+
+def is_owner(username: str) -> bool:
+    return username.lower() in OWNER_USERS
+
+
 def is_admin(username: str) -> bool:
     """Destructive actions on other people's content need an explicit admin."""
-    return username in ADMIN_USERS
+    return username.lower() in OWNER_USERS or username.lower() in ADMIN_USERS or username.lower() in DYNAMIC_ADMIN_USERS
+
+
+def require_owner(username: str) -> None:
+    if not is_owner(username):
+        raise HTTPException(status_code=403, detail="Керування ролями доступне лише власнику гри")
 
 
 def has_dev_access(username: str) -> bool:
@@ -460,6 +521,15 @@ class EventRequest(BaseModel):
 
 class FriendRequest(BaseModel):
     username: str = Field(..., min_length=3, max_length=24, pattern=r"^[A-Za-z0-9_]+$")
+
+class AdminRoleRequest(BaseModel):
+    action: str = Field(..., pattern=r"^(grant|revoke)$")
+    username: str = Field(..., min_length=3, max_length=24, pattern=r"^[A-Za-z0-9_]+$")
+
+class AdminActionRequest(BaseModel):
+    action: str = Field(..., max_length=16)
+    target: str = Field(..., min_length=3, max_length=24)
+    value: Optional[List[float] | float] = None
 
 class PlaceBlock(BaseModel):
     """A workspace part.
@@ -1044,7 +1114,7 @@ def root():
         "api_version": app.version,
         "features": [
             "stats", "friends", "place_likes", "place_plays", "place_views",
-            "model_toolbox", "dev_menu",
+            "model_toolbox", "dev_menu", "admin_controls",
         ] + (["multiplayer"] if websocket_route else []),
         "multiplayer_websocket": websocket_route,
         "websocket_path": "/ws/{place_id}" if websocket_route else None,
@@ -1086,6 +1156,10 @@ async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
             raise jwt.InvalidTokenError("Missing subject")
     except jwt.PyJWTError:
         await websocket.close(code=4401, reason="Session is invalid or expired; sign in again")
+        return
+
+    if username.lower() in BANNED_USERS:
+        await websocket.close(code=4403, reason="Account is banned from multiplayer")
         return
 
     place_record = read_json_file(f"places/{place_id}.json")
@@ -1135,6 +1209,9 @@ async def multiplayer_socket(websocket: WebSocket, place_id: str, token: str):
                 continue
             kind = message.get("type")
             if kind not in ("state", "chat", "block_upsert", "block_remove", "place_state"):
+                continue
+            if kind == "chat" and username.lower() in MUTED_USERS:
+                await websocket.send_json({"type": "notice", "message": "Чат для цього акаунта тимчасово вимкнено."})
                 continue
             if not _allow_live_message(room, websocket, kind):
                 continue
@@ -1206,6 +1283,8 @@ def register(req: AuthRequest, request: Request):
     existing = read_json_file(user_key)
     if existing:
         raise HTTPException(status_code=400, detail="Користувач з таким логіном вже існує")
+    if username in OWNER_USERS or username in ADMIN_USERS:
+        raise HTTPException(status_code=403, detail="Це захищений акаунт; його має створити оператор сервера")
 
     user_record = {
         "username": username,
@@ -1239,6 +1318,7 @@ def me(current_user: str = Depends(get_current_user)):
         "status": "ok",
         "username": current_user,
         "admin": is_admin(current_user),
+        "is_owner": is_owner(current_user),
         "dev_access": has_dev_access(current_user),
         "dev_open": not ADMIN_USERS and ALLOW_OPEN_DEV,
     }
@@ -1634,9 +1714,123 @@ def dev_whoami(current_user: str = Depends(get_current_user)):
     return {
         "username": current_user,
         "admin": is_admin(current_user),
+        "is_owner": is_owner(current_user),
         "dev_access": has_dev_access(current_user),
         "dev_open": not ADMIN_USERS and ALLOW_OPEN_DEV,
     }
+
+
+@app.get("/api/admin/overview")
+async def admin_overview(current_user: str = Depends(get_current_user)):
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Потрібен обліковий запис адміністратора")
+    async with live_rooms_lock:
+        players = sorted({
+            username
+            for room in live_rooms.values()
+            for username in room.clients.values()
+        })
+    index = load_place_index()
+    return {
+        "username": current_user,
+        "places": [public_place_summary(entry, current_user) for entry in index["places"]],
+        "players": players,
+        "muted": sorted(MUTED_USERS),
+        "banned": sorted(BANNED_USERS),
+        "plays_scope": "лічильники запусків плейсів",
+    }
+
+
+@app.get("/api/admin/admins")
+def admin_list(current_user: str = Depends(get_current_user)):
+    require_owner(current_user)
+    return {"admins": sorted(ADMIN_USERS | OWNER_USERS | DYNAMIC_ADMIN_USERS)}
+
+
+@app.post("/api/admin/admins")
+def admin_role(req: AdminRoleRequest, current_user: str = Depends(get_current_user)):
+    require_owner(current_user)
+    username = require_username(req.username)
+    if username in OWNER_USERS:
+        raise HTTPException(status_code=400, detail="Власника не можна змінювати через цей маршрут")
+    if username in ADMIN_USERS and req.action == "revoke":
+        raise HTTPException(status_code=400, detail="Це право задане змінною ADMIN_USERS у Render")
+    if req.action == "grant" and not read_json_file(f"users/{username}.json"):
+        raise HTTPException(status_code=404, detail="Користувача не знайдено")
+
+    global DYNAMIC_ADMIN_USERS
+    with _admin_roles_lock:
+        updated = set(DYNAMIC_ADMIN_USERS)
+        if req.action == "grant":
+            updated.add(username)
+        else:
+            updated.discard(username)
+        write_json_file("admin/admins.json", {"admins": sorted(updated)})
+        DYNAMIC_ADMIN_USERS = updated
+    return {"status": "success", "action": req.action, "username": username}
+
+
+@app.post("/api/admin/action")
+async def admin_action(req: AdminActionRequest, current_user: str = Depends(get_current_user)):
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Потрібен обліковий запис адміністратора")
+    target = require_username(req.target)
+    if target == current_user.lower():
+        raise HTTPException(status_code=400, detail="Не можна виконати цю дію щодо власного акаунта")
+    if is_owner(target) or (is_admin(target) and not is_owner(current_user)):
+        raise HTTPException(status_code=403, detail="Не можна модерувати власника або іншого адміністратора")
+    allowed = {"kick", "ban", "unban", "mute", "unmute", "head", "teleport"}
+    if req.action not in allowed:
+        raise HTTPException(status_code=400, detail="Невідома команда адміністратора")
+
+    async with live_rooms_lock:
+        target_sockets = [
+            (room, socket)
+            for room in live_rooms.values()
+            for socket, username in room.clients.items()
+            if username.lower() == target
+        ]
+    if not target_sockets and req.action not in {"unban", "unmute"}:
+        raise HTTPException(status_code=404, detail="Гравець не в мережі")
+
+    value: Optional[float | List[float]] = None
+    if req.action == "head":
+        if not isinstance(req.value, (int, float)) or isinstance(req.value, bool) or not math.isfinite(float(req.value)):
+            raise HTTPException(status_code=400, detail="Некоректний розмір голови")
+        value = max(1.0, min(3.0, float(req.value)))
+    elif req.action == "teleport":
+        if not isinstance(req.value, list) or len(req.value) != 3:
+            raise HTTPException(status_code=400, detail="Для телепортації потрібні координати X, Y, Z")
+        if any(not math.isfinite(coordinate) or abs(coordinate) > 10_000 for coordinate in req.value):
+            raise HTTPException(status_code=400, detail="Координати за межами плейса")
+        value = req.value
+
+    if req.action in {"ban", "unban", "mute", "unmute"}:
+        banned = set(BANNED_USERS)
+        muted = set(MUTED_USERS)
+        if req.action == "ban":
+            banned.add(target)
+        elif req.action == "unban":
+            banned.discard(target)
+        elif req.action == "mute":
+            muted.add(target)
+        else:
+            muted.discard(target)
+        _save_moderation_users(banned, muted)
+
+    if req.action in {"kick", "ban"}:
+        for room, socket in target_sockets:
+            try:
+                await socket.close(code=4001, reason="Removed by administrator")
+            except (RuntimeError, WebSocketDisconnect):
+                pass
+            room.clients.pop(socket, None)
+            await _broadcast_live(room, {"type": "left", "username": target})
+    elif req.action in {"head", "teleport"}:
+        for _, socket in target_sockets:
+            await socket.send_json({"type": "admin_effect", "action": req.action, "value": value})
+
+    return {"status": "success", "action": req.action, "target": target}
 
 
 # ---------------------------------------------------------------------------
