@@ -51,7 +51,7 @@ R2_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "aient")
 R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 STARTED_AT = time.time()
 SERVER_INSTANCE_ID = uuid.uuid4().hex
 MAX_MODEL_BYTES = 8 * 1024 * 1024
@@ -61,7 +61,7 @@ ALLOWED_MODEL_CATEGORIES = ("Shapes", "Props", "Nature", "Gameplay", "Custom")
 PLACE_ID_PATTERN = r"[a-fA-F0-9-]{1,36}"
 
 
-def _load_jwt_secret() -> str:
+def _load_jwt_secret() -> tuple[str, str]:
     """Use JWT_SECRET when provided, otherwise persist a random local secret.
 
     The repository used to ship a hard-coded signing key.  For local play we
@@ -70,7 +70,12 @@ def _load_jwt_secret() -> str:
     """
     configured = os.getenv("JWT_SECRET", "").strip()
     if len(configured.encode("utf-8")) >= 32:
-        return configured
+        return configured, "environment"
+    if os.getenv("RENDER", "").strip().lower() == "true":
+        raise RuntimeError(
+            "JWT_SECRET must be configured in Render with at least 32 bytes; "
+            "refusing to start with an instance-specific signing key."
+        )
     if configured:
         print("WARNING: JWT_SECRET is shorter than 32 bytes, generating a strong local secret instead.")
     secret_file = STORAGE_DIR / ".jwt_secret"
@@ -78,7 +83,7 @@ def _load_jwt_secret() -> str:
         if secret_file.exists():
             stored = secret_file.read_text(encoding="utf-8").strip()
             if len(stored.encode("utf-8")) >= 32:
-                return stored
+                return stored, "persistent-local"
         generated = secrets.token_urlsafe(48)
         secret_file.write_text(generated, encoding="utf-8")
         try:
@@ -86,14 +91,14 @@ def _load_jwt_secret() -> str:
         except OSError:
             pass
         print("WARNING: JWT_SECRET was not configured. Generated storage/.jwt_secret for local use.")
-        return generated
+        return generated, "persistent-local"
     except OSError:
         generated = secrets.token_urlsafe(48)
         print("WARNING: JWT_SECRET was not configured and storage is not writable; using an ephemeral secret.")
-        return generated
+        return generated, "ephemeral-local"
 
 
-JWT_SECRET = _load_jwt_secret()
+JWT_SECRET, JWT_SECRET_SOURCE = _load_jwt_secret()
 JWT_ALGORITHM = "HS256"
 
 ADMIN_USERS = {name.strip().lower() for name in os.getenv("ADMIN_USERS", "").split(",") if name.strip()}
@@ -1046,13 +1051,25 @@ def root():
         "storage": "Cloudflare R2 + local disk" if s3_client else "Local disk",
         "models": len(model_index()),
         "places": len(load_place_index()["places"]),
+        "auth_ready": JWT_SECRET_SOURCE == "environment",
+        "auth_key_source": JWT_SECRET_SOURCE,
+        "instance_id": SERVER_INSTANCE_ID,
+        "deployment_commit": os.getenv("RENDER_GIT_COMMIT", "")[:12],
         "time": now_iso(),
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": APP_VERSION, "time": now_iso()}
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "auth_ready": JWT_SECRET_SOURCE == "environment",
+        "auth_key_source": JWT_SECRET_SOURCE,
+        "instance_id": SERVER_INSTANCE_ID,
+        "deployment_commit": os.getenv("RENDER_GIT_COMMIT", "")[:12],
+        "time": now_iso(),
+    }
 
 
 
@@ -1225,6 +1242,46 @@ def me(current_user: str = Depends(get_current_user)):
         "dev_access": has_dev_access(current_user),
         "dev_open": not ADMIN_USERS and ALLOW_OPEN_DEV,
     }
+
+@app.get("/api/skins/me")
+def get_my_skin(current_user: str = Depends(get_current_user)):
+    skin = read_json_file(f"skins/{current_user}.json")
+    if not skin:
+        raise HTTPException(status_code=404, detail="Скін ще не збережено")
+    return skin
+
+
+@app.put("/api/skins/me")
+def save_my_skin(payload: dict, current_user: str = Depends(get_current_user)):
+    if len(json.dumps(payload, ensure_ascii=False)) > 16_384:
+        raise HTTPException(status_code=413, detail="Дані скіна завеликі")
+
+    allowed = {
+        "headColorHex", "torsoColorHex", "leftArmColorHex", "rightArmColorHex",
+        "leftLegColorHex", "rightLegColorHex", "hat", "face", "faceAsset",
+    }
+    if set(payload) - allowed:
+        raise HTTPException(status_code=400, detail="Невідомі поля скіна")
+    for key in (
+        "headColorHex", "torsoColorHex", "leftArmColorHex",
+        "rightArmColorHex", "leftLegColorHex", "rightLegColorHex",
+    ):
+        value = payload.get(key)
+        if not isinstance(value, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+            raise HTTPException(status_code=400, detail="Некоректний колір скіна")
+    if payload.get("hat") not in {"None", "Cap", "Fedora", "TopHat", "Helmet"}:
+        raise HTTPException(status_code=400, detail="Некоректний головний убір")
+    if payload.get("face") not in {"Smile", "Sunglasses", "Angry", "Cyborg"}:
+        raise HTTPException(status_code=400, detail="Некоректне стандартне обличчя")
+    face_asset = payload.get("faceAsset", "")
+    if not isinstance(face_asset, str) or (
+        face_asset and not re.fullmatch(r"CLASSIC_FACES/[^/\\]{1,180}\.png", face_asset)
+    ):
+        raise HTTPException(status_code=400, detail="Некоректне ім’я ресурсу обличчя")
+
+    write_json_file(f"skins/{current_user}.json", payload)
+    return {"status": "success", "storage": "r2" if s3_client else "local"}
+
 
 @app.post("/api/places/save")
 @storage_locked
